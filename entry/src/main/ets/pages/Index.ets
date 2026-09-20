@@ -1,26 +1,29 @@
-import { hilog } from '@kit.PerformanceAnalysisKit';
-import testNapi from 'libentry.so';
-
-const DOMAIN = 0x0000;
+// 宿主页面：Navigation + NavPathStack 承载控制台视图，并注册录制列表路由（T015/T027）
+import { ConsoleView } from '../views/ConsoleView';
+import { RecordingsView } from '../views/RecordingsView';
+import { ROUTE_RECORDINGS } from '../model/Types';
 
 @Entry
-@Component
+@ComponentV2
 struct Index {
-  @State message: string = 'Hello World';
+  pathStack: NavPathStack = new NavPathStack();
 
   build() {
-    Row() {
-      Column() {
-        Text(this.message)
-          .fontSize($r('app.float.page_text_font_size'))
-          .fontWeight(FontWeight.Bold)
-          .onClick(() => {
-            this.message = 'Welcome';
-            hilog.info(DOMAIN, 'testTag', 'Test NAPI 2 + 3 = %{public}d', testNapi.add(2, 3));
-          })
-      }
-      .width('100%')
+    Navigation(this.pathStack) {
+      ConsoleView({ pathStack: this.pathStack })
     }
-    .height('100%')
+    .mode(NavigationMode.Stack)
+    .hideTitleBar(true)
+    .navDestination(this.pageMap)
+  }
+
+  @Builder
+  pageMap(name: string) {
+    if (name === ROUTE_RECORDINGS) {
+      NavDestination() {
+        RecordingsView()
+      }
+      .title('录制列表')
+    }
   }
 }

@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "label"
+    },
+    {
+      "name": "mic_permission_reason",
+      "value": "录屏推流需要采集麦克风音频"
     }
   ]
 }
