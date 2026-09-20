@@ -1,6 +1,6 @@
 # the minimum version of CMake.
 cmake_minimum_required(VERSION 3.5.0)
-project(myNpmLib)
+project(media_stream)
 
 set(NATIVERENDER_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -8,8 +8,39 @@ if(DEFINED PACKAGE_FIND_FILE)
     include(${PACKAGE_FIND_FILE})
 endif()
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 include_directories(${NATIVERENDER_ROOT_PATH}
                     ${NATIVERENDER_ROOT_PATH}/include)
 
-add_library(media_stream SHARED napi_init.cpp)
-target_link_libraries(media_stream PUBLIC libace_napi.z.so)
+# 原生实现按域组织：napi 桥接 / core 控制面 / capture 采集 / codec 编码 / audio 混音 / muxer 封装 / rtmp 推流 / common 公共设施
+add_library(media_stream SHARED
+    napi/napi_init.cpp
+    napi/js_event_emitter.cpp
+    core/media_stream_engine.cpp
+    capture/screen_capture.cpp
+    capture/color_converter.cpp
+    codec/video_encoder.cpp
+    codec/audio_encoder.cpp
+    audio/audio_mixer.cpp
+    muxer/mp4_recorder.cpp
+    rtmp/rtmp_client.cpp
+    rtmp/amf.cpp
+    rtmp/flv_packager.cpp
+)
+
+# 链接 OHOS 系统能力库（全部来自 SDK sysroot，零三方依赖）
+target_link_libraries(media_stream PUBLIC
+    libace_napi.z.so
+    libnative_avscreen_capture.so
+    libnative_buffer.so
+    libnative_media_venc.so
+    libnative_media_aenc.so
+    libnative_media_codecbase.so
+    libnative_media_acodec.so
+    libnative_media_avmuxer.so
+    libnative_media_core.so
+    libnative_display_manager.so
+    libhilog_ndk.z.so
+)

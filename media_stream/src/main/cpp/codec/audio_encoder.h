@@ -1,0 +1,68 @@
+#ifndef MEDIA_STREAM_AUDIO_ENCODER_H
+#define MEDIA_STREAM_AUDIO_ENCODER_H
+
+// OH_AACEncoder AAC 硬件编码封装（AAC-LC 48kHz 双声道，128kbps）
+// 音频编码器仅支持 async memory 回调模式：
+//  - onNeedInputData：从内部 PCM 队列取数据填入 OH_AVMemory，PushInputData 提交
+//  - onNewOutputData：AAC 原始帧（已禁用 ADTS），首帧提取 ASC（AudioSpecificConfig）
+// ASC 同时供 MP4 音轨 OH_MD_KEY_CODEC_CONFIG 与 RTMP audio sequence header
+
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <vector>
+
+struct OH_AVCodec;
+struct OH_AVMemory;
+struct OH_AVFormat;
+struct OH_AVCodecBufferAttr;
+
+namespace media_stream {
+
+class AudioEncoder {
+public:
+    // AAC 帧输出回调：data 为原始 AAC（无 ADTS 头），ptsUs 微秒
+    using OutputCallback = std::function<void(const uint8_t *data, int32_t size, int64_t ptsUs)>;
+    // ASC 回调（AudioSpecificConfig 原始字节）
+    using AscCallback = std::function<void(const std::vector<uint8_t> &asc)>;
+    using ErrorCallback = std::function<void(int32_t errorCode)>;
+
+    struct Callbacks {
+        OutputCallback onOutput;
+        AscCallback onAsc;
+        ErrorCallback onError;
+    };
+
+    AudioEncoder() = default;
+    ~AudioEncoder();
+
+    bool Start(Callbacks callbacks);
+    // 投递 PCM（s16le 48k 双声道交错）；队列满（>500ms）时丢弃最旧数据
+    void InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs);
+    void Stop();
+
+    bool IsRunning() const { return running_; }
+
+private:
+    static void OnCodecError(OH_AVCodec *codec, int32_t errorCode, void *userData);
+    static void OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *userData);
+    static void OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, void *userData);
+    static void OnNewOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data,
+                                OH_AVCodecBufferAttr *attr, void *userData);
+
+    OH_AVCodec *encoder_ = nullptr;
+    Callbacks callbacks_;
+    std::mutex mutex_;
+    bool running_ = false;
+
+    // PCM 输入队列（采样点为单位，s16）
+    std::deque<int16_t> pcmQueue_;
+    int64_t pcmPtsNs_ = 0;
+    bool ascEmitted_ = false;
+    std::vector<uint8_t> asc_;
+};
+
+} // namespace media_stream
+
+#endif // MEDIA_STREAM_AUDIO_ENCODER_H

@@ -10,3 +10,5 @@
 /.clang-tidy
 **/.test
 /.appanalyzer
+# 开发期参考克隆（独立 git 仓库），不纳入本工程提交
+/Harmony-OBS-Studio
