@@ -136,7 +136,7 @@
 **Purpose**: 构建与部署验证（依据用户选择：仅 build + deploy，不运行 UI 遍历验证）
 
 - [x] T032 调用 build_project 构建整个工程（default product，debug），修复所有编译/链接/ArkTS 严格模式错误，迭代直至构建成功
-- [ ] T033 调用 start_app 将应用部署到可用设备/模拟器，确认可安装启动
+- [x] T033 调用 start_app 将应用部署到可用设备/模拟器，确认可安装启动
 
 ---
 
