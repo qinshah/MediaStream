@@ -1,0 +1,11 @@
+{
+  "name": "media_stream",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "Index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "libmedia_stream.so": "file:./src/main/cpp/types/libmedia_stream"
+  }
+}
