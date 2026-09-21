@@ -88,17 +88,7 @@ void MediaStreamEngine::EmitMicDegraded() {
     }
 }
 
-// —— 预设与尺寸 ——
-
-int MediaStreamEngine::PresetShortEdge(const std::string &preset) {
-    if (preset == "1080p") {
-        return 1080;
-    }
-    if (preset == "480p") {
-        return 480;
-    }
-    return 720;
-}
+// —— 采集/编码尺寸 ——
 
 bool MediaStreamEngine::ComputeCaptureSize(int &width, int &height) {
     int32_t dw = 0, dh = 0;
@@ -106,16 +96,11 @@ bool MediaStreamEngine::ComputeCaptureSize(int &width, int &height) {
         MS_LOG_ERROR("QueryDisplaySize failed");
         return false;
     }
-    // 以短边为目标，长边按屏幕宽高比等比缩放
-    int targetShort = PresetShortEdge(config_.preset);
-    bool portrait = dw < dh;
-    int shortEdge = portrait ? dw : dh;
-    int longEdge = portrait ? dh : dw;
-    double ratio = static_cast<double>(targetShort) / static_cast<double>(shortEdge);
-    int newLong = static_cast<int>(std::lround(longEdge * ratio));
-    // 偶数对齐
-    width = (portrait ? (newLong & ~1) : (targetShort & ~1));
-    height = (portrait ? (targetShort & ~1) : (newLong & ~1));
+    // 原始流（OH_ORIGINAL_STREAM）模式下，videoFrameWidth/Height 必须与显示器的原生分辨率一致，
+    // 否则 OH_AVScreenCapture_Init 会返回 OPERATE_NOT_PERMIT(rc=2)。因此这里直接返回原生显示尺寸
+    // （自然方向，不做缩放/剪裁——此前按预设短边缩放并翻转了方向，导致 Init 被拒，回退 RGBA 又是占位灰帧，最终录成全黑）。
+    width = dw & ~1;
+    height = dh & ~1;
     return true;
 }
 

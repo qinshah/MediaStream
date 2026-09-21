@@ -105,9 +105,7 @@ private:
     void StartStatsLocked();
     void StopStatsLocked();
 
-    // 预设 → 短边像素
-    static int PresetShortEdge(const std::string &preset);
-    // 按屏幕宽高比缩放预设短边，偶数对齐
+    // 按屏幕原生分辨率确定采集/编码尺寸（原始流要求与显示器一致）
     bool ComputeCaptureSize(int &width, int &height);
 
     std::mutex mutex_; // 保护全部状态与对象生命周期
@@ -139,6 +137,7 @@ private:
 
     // RGBA 兜底转换暂存
     std::vector<uint8_t> rgbaToNv12Scratch_;
+    
 
     // 统计
     std::thread statsThread_;

@@ -266,11 +266,23 @@ void ScreenCapture::HandleVideoBuffer(OH_AVBuffer *buffer) {
     }
 
     if (fmt == 2) {
-        // NV12：Y 平面 w*h + UV 交错平面 w*h/2；容量含行对齐时 y_stride≈容量/1.5h
-        size_t yStride = (static_cast<size_t>(capacity) * 2) / (static_cast<size_t>(h) * 3);
-        yStride = (yStride + 15u) & ~static_cast<size_t>(15u);
-        if (yStride < static_cast<size_t>(w)) {
-            yStride = static_cast<size_t>(w);
+        // NV12：Y 平面 w*h + UV 交错平面 w*h/2。行距优先取 NativeBuffer 元数据真值，
+        // 容量推断在原生分辨率尺寸下可能算错（如 1224x2776 会推出的行距≠真实值），导致斜条纹撕裂。
+        size_t yStride = 0;
+        OH_NativeBuffer *nb = OH_AVBuffer_GetNativeBuffer(buffer);
+        if (nb != nullptr) {
+            OH_NativeBuffer_Config nbConfig = {};
+            OH_NativeBuffer_GetConfig(nb, &nbConfig);
+            if (nbConfig.stride >= w) {
+                yStride = static_cast<size_t>(nbConfig.stride);
+            }
+        }
+        if (yStride == 0) {
+            yStride = (static_cast<size_t>(capacity) * 2) / (static_cast<size_t>(h) * 3);
+            yStride = (yStride + 15u) & ~static_cast<size_t>(15u);
+            if (yStride < static_cast<size_t>(w)) {
+                yStride = static_cast<size_t>(w);
+            }
         }
         uint8_t *dstY = packed.data();
         for (int row = 0; row < h; row++) {
