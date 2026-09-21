@@ -352,11 +352,27 @@ bool RtmpClient::ConnectSocket() {
         return false;
     }
     if (rc < 0) {
-        fd_set writeFds;
-        FD_ZERO(&writeFds);
-        FD_SET(fd, &writeFds);
-        struct timeval tv = {kConnectTimeoutMs / 1000, (kConnectTimeoutMs % 1000) * 1000};
-        if (select(fd + 1, nullptr, &writeFds, nullptr, &tv) <= 0) {
+        // 分片等待连接完成：总超时仍为 kConnectTimeoutMs，但每 100ms 检查一次 stopRequested_。
+        // 一次性 select 等满 5s 会让 Stop() 的 join 被拖住最多 5s，而它是 JS 线程同步调用，
+        // 表现就是「点停止推流界面卡住」（连接不存在/不可达时尤其明显）。
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kConnectTimeoutMs);
+        bool writable = false;
+        while (!stopRequested_.load() && std::chrono::steady_clock::now() < deadline) {
+            fd_set writeFds;
+            FD_ZERO(&writeFds);
+            FD_SET(fd, &writeFds);
+            struct timeval tv = {0, 100000}; // 100ms 分片
+            int sel = select(fd + 1, nullptr, &writeFds, nullptr, &tv);
+            if (sel > 0) {
+                writable = true;
+                break;
+            }
+            if (sel < 0 && errno != EINTR) {
+                break;
+            }
+        }
+        if (!writable) {
             close(fd);
             return false;
         }

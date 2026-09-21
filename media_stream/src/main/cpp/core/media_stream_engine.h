@@ -99,6 +99,12 @@ private:
     void TryStartPendingRecordLocked(); // 编码配置齐全后启动挂起的录制
     void StartMuxerLocked();            // 音视频编码配置齐备（或音频等待超时）后真正启动 muxer
 
+    // 取 rtmpClient_ 的快照（锁内拷贝 shared_ptr）。
+    // 停止/销毁路径会在锁内把 rtmpClient_ 置空并释放对象，而编码回调线程与统计线程
+    // 是不持锁访问它的：直接裸读会「读到非空但对象已被释放」→ UAF 崩溃（表现为点停止
+    // 推流时闪退）。改为短锁取快照后使用，对象生命周期由 shared_ptr 保证。
+    std::shared_ptr<RtmpClient> RtmpSnapshotLocked();
+
     // 事件上报
     void EmitCaptureState(const char *state);
     void EmitStreamState(const char *state, int reconnectAttempt = 0);
@@ -135,7 +141,7 @@ private:
     std::unique_ptr<VideoEncoder> videoEncoder_;
     std::unique_ptr<AudioEncoder> audioEncoder_;
     std::unique_ptr<AudioMixer> mixer_;
-    std::unique_ptr<RtmpClient> rtmpClient_;
+    std::shared_ptr<RtmpClient> rtmpClient_; // shared_ptr：调用方可持快照跨锁使用（见 RtmpSnapshotLocked）
     std::unique_ptr<Mp4Recorder> mp4Recorder_;
 
     // 编码配置缓存（MP4 AddTrack / RTMP sequence header / 重连重发三处共享）

@@ -286,7 +286,7 @@ bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::
     streamState_ = "connecting";
     EmitStreamState("connecting");
 
-    rtmpClient_ = std::make_unique<RtmpClient>();
+    rtmpClient_ = std::make_shared<RtmpClient>();
     // 推流配置预置：metadata 与音频 ASC 在 publish 成功前就备好，Publish.Start 后立即随控制队列发出。
     // 音频 ASC 采用「编码器真值优先、未回传则定值兜底」策略（与录制路径一致）：
     // 部分机型 OH_AudioEncoder 不回传 ASC，若坐等真值会导致推流端无 AAC sequence header → 无声。
@@ -346,17 +346,27 @@ bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::
     return true;
 }
 
+std::shared_ptr<RtmpClient> MediaStreamEngine::RtmpSnapshotLocked() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rtmpClient_;
+}
+
 void MediaStreamEngine::StopStreaming() {
+    // 锁内只发布状态、把 RtmpClient 摘出引擎；真正的 Stop() 放到锁外。
+    // 关键：RtmpClient::Stop() 会 join 网络线程，并在返回前回调 onState(kStopped)，
+    // 该回调需要 lock(mutex_)。若持 mutex_ 调用 Stop()，就是「持锁者等 join、被 join 者等锁」
+    // 的确定性死锁 —— JS 线程卡在同步 napi 调用上（UI 冻结），随后被判 ANR 杀进程（闪退）。
+    std::shared_ptr<RtmpClient> client;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (rtmpClient_) {
-            rtmpClient_->Stop();
-            rtmpClient_.reset();
-        }
+        client = std::move(rtmpClient_);
         if (streamState_ != "error") {
             streamState_ = "idle";
             EmitStreamState("stopped");
         }
+    }
+    if (client) {
+        client->Stop(); // 锁外：join 与 onState 回调均可安全加锁
     }
     // 管线收尾放到锁外（OH_*_Stop 在锁外执行，避免与采集/编码回调线程锁互斥量死锁）
     MaybeStopPipelineUnlocked();
@@ -430,18 +440,25 @@ void MediaStreamEngine::StopRecording() {
 
 void MediaStreamEngine::Destroy() {
     Mp4Recorder *recorder = nullptr;
+    std::shared_ptr<RtmpClient> client;
+    std::thread statsThread;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pendingRecord_ = false;
         statsRunning_ = false;
         if (statsThread_.joinable()) {
-            statsThread_.join();
+            statsThread = std::move(statsThread_);
         }
-        if (rtmpClient_) {
-            rtmpClient_->Stop();
-            rtmpClient_.reset();
-        }
+        client = std::move(rtmpClient_);
         recorder = mp4Recorder_.get();
+    }
+    // 两处等待都必须在锁外完成：被等待的线程收尾时会回调 onState / EmitStats 并重新
+    // lock(mutex_)，持锁等待即死锁（与 StopStreaming 同一类问题）。
+    if (statsThread.joinable()) {
+        statsThread.join();
+    }
+    if (client) {
+        client->Stop();
     }
     // 同样在锁外 join 写线程，避免 onFinished 重新加锁造成死锁。
     // Stop() 已改为非阻塞(detach)：此处用超时等待写线程真正退出后再 reset，避免销毁
@@ -836,9 +853,10 @@ void MediaStreamEngine::OnEncodedVideo(const uint8_t *data, int32_t size, int64_
         start = nowNs;
     }
     int64_t newPtsUs = (nowNs - start) / 1000;
-    // 分发：RTMP + MP4
-    if (rtmpClient_) {
-        rtmpClient_->SendVideo(data, size, newPtsUs, isKeyframe);
+    // 分发：RTMP + MP4。RTMP 侧取锁内快照（本回调线程不持锁，裸读 rtmpClient_ 有 UAF 风险）
+    std::shared_ptr<RtmpClient> rtmp = RtmpSnapshotLocked();
+    if (rtmp) {
+        rtmp->SendVideo(data, size, newPtsUs, isKeyframe);
     }
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -859,8 +877,9 @@ void MediaStreamEngine::OnEncodedVideo(const uint8_t *data, int32_t size, int64_
 }
 
 void MediaStreamEngine::OnEncodedAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
-    if (rtmpClient_) {
-        rtmpClient_->SendAudio(data, size, ptsUs);
+    std::shared_ptr<RtmpClient> rtmp = RtmpSnapshotLocked();
+    if (rtmp) {
+        rtmp->SendAudio(data, size, ptsUs);
     }
     if (mp4Recorder_ && mp4Started_) {
         mp4Recorder_->WriteAudio(data, size, ptsUs);
@@ -1002,11 +1021,12 @@ void MediaStreamEngine::StatsThreadMain() {
         lastStatsFrames_ = frames;
         lastStatsBytes_ = bytes;
 
-        if (rtmpClient_) {
+        std::shared_ptr<RtmpClient> rtmp = RtmpSnapshotLocked();
+        if (rtmp) {
             e.hasSentBytes = true;
-            e.sentBytes = rtmpClient_->SentBytes();
+            e.sentBytes = rtmp->SentBytes();
             e.hasDroppedFrames = true;
-            e.droppedVideoFrames = rtmpClient_->DroppedVideoFrames();
+            e.droppedVideoFrames = rtmp->DroppedVideoFrames();
             if (streamStartMs_ < 0) {
                 // 记下推流真正的起始时刻（steady 毫秒）。此前赋 0 会让「推流时长」变成
                 // steady_clock 自 epoch 起的绝对值（真机实测显示成设备开机时长 32588:48）。
