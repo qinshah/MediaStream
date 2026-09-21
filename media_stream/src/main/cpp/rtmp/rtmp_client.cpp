@@ -3,11 +3,12 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -35,6 +36,60 @@ static constexpr uint8_t kMsgAudio = 8;
 static constexpr uint8_t kMsgVideo = 9;
 static constexpr uint8_t kMsgDataAmf0 = 18;   // @setDataFrame
 static constexpr uint8_t kMsgCommandAmf0 = 20;
+
+// 等待 fd 可读/可写。返回 1=就绪，0=超时，-1=错误或描述符无效。
+//
+// 这里刻意用 poll 而非 select：select 的 FD_SET 会被 musl 的 fortify 检查拦下
+// （fd >= FD_SETSIZE(1024) 时直接 __fortify_error → abort），真机上抓到过由此产生的
+// SIGABRT（栈：__fd_chk → RtmpClient::ConnectSocket）。应用进程 fd 数量受屏幕采集/
+// 编解码/SDK 影响不可控，一旦越界就是整个进程被 abort，代价过高；poll 无 FD_SETSIZE
+// 上限，且 fd 非法时只是返回 POLLNVAL，可以优雅判失败。
+static int WaitFd(int fd, short events, int timeoutMs) {
+    if (fd < 0) {
+        return -1;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        long remain = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+        if (remain < 0) {
+            remain = 0;
+        }
+        struct pollfd pfd = {};
+        pfd.fd = fd;
+        pfd.events = events;
+        int rc = poll(&pfd, 1, static_cast<int>(remain));
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (rc == 0) {
+            return 0; // 超时
+        }
+        if ((pfd.revents & POLLNVAL) != 0) {
+            return -1; // fd 已失效（被误关/越界）
+        }
+        return 1;
+    }
+}
+
+// 当前进程已打开的 fd 数量（诊断用）：socket 拿到的 fd 号逼近 FD_SETSIZE 时，
+// 说明进程 fd 泄漏，属于需要单独追查的系统性问题。
+static int CountOpenFds() {
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return -1;
+    }
+    int count = 0;
+    while (readdir(dir) != nullptr) {
+        count++;
+    }
+    closedir(dir);
+    return count > 2 ? count - 2 : 0; // 去掉 "." 与 ".."
+}
 
 RtmpClient::~RtmpClient() {
     Stop();
@@ -283,19 +338,12 @@ bool RtmpClient::RunSession() {
     // 推流循环：接收（onStatus 监控）+ 发送（队列出队）
     while (!stopRequested_.load()) {
         // 非阻塞收包（10ms 轮询）
-        fd_set readFds;
-        FD_ZERO(&readFds);
-        FD_SET(socketFd_, &readFds);
-        struct timeval tv = {0, 10000};
-        int sel = select(socketFd_ + 1, &readFds, nullptr, nullptr, &tv);
-        if (sel < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            MS_LOG_WARN("socket select error %{public}d", errno);
+        int ready = WaitFd(socketFd_, POLLIN, 10);
+        if (ready < 0) {
+            MS_LOG_WARN("socket poll failed fd=%{public}d errno=%{public}d", socketFd_, errno);
             break;
         }
-        if (sel > 0 && FD_ISSET(socketFd_, &readFds)) {
+        if (ready == 1) {
             if (!RecvMessage()) {
                 MS_LOG_WARN("socket recv failed / closed");
                 break;
@@ -342,7 +390,7 @@ bool RtmpClient::ConnectSocket() {
         freeaddrinfo(res);
         return false;
     }
-    // 非阻塞连接 + select 超时
+    // 非阻塞连接 + poll 分片超时
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     int rc = connect(fd, res->ai_addr, res->ai_addrlen);
@@ -351,24 +399,29 @@ bool RtmpClient::ConnectSocket() {
         close(fd);
         return false;
     }
+    MS_LOG_INFO("rtmp connecting %{public}s:%{public}d fd=%{public}d openFds=%{public}d", url_.host.c_str(),
+                url_.port, fd, CountOpenFds());
     if (rc < 0) {
         // 分片等待连接完成：总超时仍为 kConnectTimeoutMs，但每 100ms 检查一次 stopRequested_。
-        // 一次性 select 等满 5s 会让 Stop() 的 join 被拖住最多 5s，而它是 JS 线程同步调用，
+        // 一次性等满 5s 会让 Stop() 的 join 被拖住最多 5s，而它是 JS 线程同步调用，
         // 表现就是「点停止推流界面卡住」（连接不存在/不可达时尤其明显）。
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(kConnectTimeoutMs);
         bool writable = false;
-        while (!stopRequested_.load() && std::chrono::steady_clock::now() < deadline) {
-            fd_set writeFds;
-            FD_ZERO(&writeFds);
-            FD_SET(fd, &writeFds);
-            struct timeval tv = {0, 100000}; // 100ms 分片
-            int sel = select(fd + 1, nullptr, &writeFds, nullptr, &tv);
-            if (sel > 0) {
-                writable = true;
+        while (!stopRequested_.load()) {
+            long leftMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+            if (leftMs <= 0) {
                 break;
             }
-            if (sel < 0 && errno != EINTR) {
+            int slice = leftMs < 100 ? static_cast<int>(leftMs) : 100; // 100ms 分片
+            int ready = WaitFd(fd, POLLOUT, slice);
+            if (ready < 0) {
+                break;
+            }
+            if (ready == 1) {
+                writable = true;
                 break;
             }
         }
@@ -534,7 +587,7 @@ void RtmpClient::WriteCommandMessage(OutMessage &msg, const std::vector<uint8_t>
 // —— 命令等待与响应接收 ——
 // 单线程模型下服务端响应只能通过 RecvMessage() 落地。此前"发完命令就阻塞等条件变量"，
 // 等待期间无人读 socket，_result/onStatus 永远解析不到 → 固定 5s 超时后断连重连。
-// 因此等待响应必须同时 select 轮询并解析入站消息。
+// 因此等待响应必须同时轮询 socket 并解析入站消息。
 bool RtmpClient::WaitWithRecv(const std::function<bool()> &done, int timeoutMs) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     for (;;) {
@@ -550,19 +603,12 @@ bool RtmpClient::WaitWithRecv(const std::function<bool()> &done, int timeoutMs) 
         if (std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
-        fd_set readFds;
-        FD_ZERO(&readFds);
-        FD_SET(socketFd_, &readFds);
-        struct timeval tv = {0, 5000}; // 5ms 轮询粒度
-        int sel = select(socketFd_ + 1, &readFds, nullptr, nullptr, &tv);
-        if (sel < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            MS_LOG_WARN("rtmp wait select err %{public}d", errno);
+        int ready = WaitFd(socketFd_, POLLIN, 5); // 5ms 轮询粒度
+        if (ready < 0) {
+            MS_LOG_WARN("rtmp wait poll err fd=%{public}d errno=%{public}d", socketFd_, errno);
             return false;
         }
-        if (sel > 0 && FD_ISSET(socketFd_, &readFds)) {
+        if (ready == 1) {
             if (!RecvMessage()) {
                 MS_LOG_WARN("rtmp recv failed while awaiting response");
                 std::lock_guard<std::mutex> lk(cmdMutex_);
