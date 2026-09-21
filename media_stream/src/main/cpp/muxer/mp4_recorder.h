@@ -44,9 +44,11 @@ public:
     Mp4Recorder() = default;
     ~Mp4Recorder();
 
-    // 启动录制；avcC 就绪即可（asc 可选：无系统音频时仅视频轨，静音画面也能落盘）
+    // 启动录制；avcC 就绪即可（asc 可选：无系统音频时仅视频轨，静音画面也能落盘）。
+    // basePtsUs：本文件的时间轴零点，由调用方在「用户按下录制」那一刻取会话相对时间传入
+    // （-1 表示不指定，退回旧的「等两轨首样本取 min」行为）。见 .cpp 中 Start 内注释。
     bool Start(const std::string &dirPath, int width, int height, const std::vector<uint8_t> &avcC,
-               const std::vector<uint8_t> &asc, Callbacks callbacks);
+               const std::vector<uint8_t> &asc, int64_t basePtsUs, Callbacks callbacks);
 
     void WriteVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe);
     void WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs);
@@ -56,7 +58,9 @@ public:
     // 被看门狗 THREAD_BLOCK 判冻结杀进程。因此改为 detach，让写线程在后台自行
     // 完成 muxer 收尾（写 moov→Destroy→close→onFinished）。调用方需通过
     // WaitWriteThreadDone() 在销毁本对象前确认写线程已退出，避免悬垂 this(UAF)。
-    void Stop();
+    // audioDrainMs > 0 时：视频轨立即关闭，音频继续接收这么多毫秒再收尾（排空音频链路里
+    // 已采集但还没从编码器出来的尾巴）。0 = 立即收尾。
+    void Stop(int64_t audioDrainMs = 0);
 
     // 有界等待写线程结束；返回 true 表示已退出。timeoutMs 上限，避免调用方无限阻塞。
     bool WaitWriteThreadDone(int64_t timeoutMs);
@@ -89,7 +93,8 @@ private:
 
     std::unique_ptr<BoundedQueue<Sample>> queue_;
     std::thread writeThread_;
-    std::atomic<bool> recording_{false};
+    std::atomic<bool> recording_{false};     // 会话存活（Start 到写线程收尾）
+    std::atomic<bool> accepting_{false};     // 是否接受 Write*（排空音频尾巴期间仍为 true）
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> storageError_{false};
 
@@ -108,6 +113,16 @@ private:
     bool hasVideoTrack_ = false;
     bool hasAudioTrack_ = false;
     std::atomic<int64_t> droppedEarly_{0};
+    // 视频轨是否已开始写入。首个样本必须是同步样本，否则文件开头没有参考帧、播放器读不出画面。
+    std::atomic<bool> videoStarted_{false};
+    // 停止后是否还允许写视频：排空音频尾巴期间必须关掉视频，否则文件尾部会多出「按下停止之后」
+    // 的几秒画面（等于把「结尾只有画面没声音」换成「多一段停止后的画面」，两头都没修）。
+    std::atomic<bool> videoOpen_{true};
+    int64_t videoGateStartMs_ = 0;
+    std::atomic<int64_t> droppedNoIdr_{0};
+    // 音频尾巴排空
+    std::atomic<bool> draining_{false};
+    std::atomic<int64_t> drainUntilMs_{0};
     std::atomic<int64_t> lastPtsUs_{0};
     // 录制时长按真实墙钟计算（设备编码器 pts 绝对时钟不可靠，不能用 (last-first)/1000）
     std::atomic<int64_t> startSteadyMs_{0};

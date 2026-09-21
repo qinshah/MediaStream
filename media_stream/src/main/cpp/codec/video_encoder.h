@@ -42,6 +42,11 @@ public:
     bool Start(int width, int height, int fps, int bitrateKbps, Callbacks callbacks);
     // 投递一帧 NV12（紧凑打包 w*h*1.5）；编码器未运行或暂无输入缓冲时丢弃
     void InputFrame(const uint8_t *nv12, int64_t ptsUs);
+
+    // 强制请求一个 IDR，不受 kKeyFrameIntervalMs 节流。给「中途挂上来的录制」用：录制起点
+    // 落在 GOP 中间时，视频轨头几个样本没有参考帧 → 播放器开头读不出画面（真机实测头 3.0s/18
+    // 个样本不可解码）。时间驱动的请求最坏要等一个 2s 间隔，所以这里必须能强制。
+    void RequestKeyFrameNow();
     // 停止并释放（幂等）
     void Stop();
 

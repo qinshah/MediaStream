@@ -220,6 +220,9 @@ private:
     // 原点能相差几十秒（真机抓到同一录制文件里音频 rawPts=88.85s、视频 rawPts=0），时间戳
     // 被夹到 0 或跳到远端 → 播放器为对齐而反复丢/补帧（听感即电音），录制文件开头也缺画面。
     std::atomic<int64_t> captureLastNs_{0};
+    // 最近一次交给录制的音频样本 pts（会话相对 μs）。停止录制时用它算音频链路的内容积压，
+    // 决定「排空音频尾巴」等多久（积压越大，立即收尾丢掉的尾音越多）。
+    std::atomic<int64_t> lastAudioPtsUs_{0};
     std::atomic<int> dumpFrames_{0}; // [DBG] 采集原始 RGBA 抽样帧计数（限前3帧）
     std::atomic<int> dbgFrameCtr_{0}; // [DBG] 进编码器缓冲采样计数（降频：每 30 帧一条）
     std::atomic<int64_t> sessionStartNs_{-1}; // 管线启动即确定，会话内不再重置

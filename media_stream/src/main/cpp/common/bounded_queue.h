@@ -85,6 +85,22 @@ public:
         return true;
     }
 
+    // 带超时的出队：取到元素返回 true；超时或「已关闭且为空」返回 false。
+    // 供 MP4 写线程在「停录后继续排空音频尾巴」期间使用 —— 那里既不能无限阻塞（音频真断流
+    // 时文件将永远不收尾），也不能立刻返回（在途样本还没到）。
+    bool PopTimed(T &out, int64_t timeoutMs) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notEmpty_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                           [this] { return !queue_.empty() || closed_; });
+        if (queue_.empty()) {
+            return false;
+        }
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        notFull_.notify_one();
+        return true;
+    }
+
     // 关闭队列：唤醒所有等待者；Pop 在排空后返回 false
     void Close() {
         std::lock_guard<std::mutex> lock(mutex_);

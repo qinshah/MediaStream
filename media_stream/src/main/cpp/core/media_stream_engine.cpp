@@ -453,8 +453,19 @@ void MediaStreamEngine::StopRecording() {
     // 写线程收尾会回调 onFinished 并重新 lock(mutex_)。因此先短暂上锁更新状态并取出指针，
     // 释放锁后再调非阻塞 Stop()（不做同步 join，绝不拖死调用线程）。
     Mp4Recorder *recorder = nullptr;
+    int64_t drainMs = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (mp4Started_) {
+            // 音频链路（采集→混音→AAC 编码器）有 0.3~1.4s 内容积压：停止的那一刻，已采集但
+            // 还没出来的音频还有 (now - 最后音频样本 pts) 这么多。立即收尾会把它整段丢掉，
+            // 于是文件尾部只剩画面没有声音。这里把这个差值交给录制器，让它有界地等一等。
+            int64_t nowUs = SessionRelativeNs(NowNs()) / 1000;
+            int64_t lastUs = lastAudioPtsUs_.load(std::memory_order_relaxed);
+            if (lastUs > 0 && nowUs > lastUs) {
+                drainMs = (nowUs - lastUs) / 1000;
+            }
+        }
         pendingRecord_ = false;
         pendingVideo_.clear(); // muxer 未启动即停止：丢弃缓存的待写视频帧
         // 立即反映停止意图：即使写线程在 OH_AVMuxer 内挂死、onFinished 迟迟不来，
@@ -464,7 +475,9 @@ void MediaStreamEngine::StopRecording() {
         recorder = mp4Recorder_.get();
     }
     if (recorder != nullptr) {
-        recorder->Stop(); // 触发 onFinished（在写线程上，锁已释放，不会死锁）
+        // 触发 onFinished（在写线程上，锁已释放，不会死锁）。drainMs>0 时写线程会先把音频
+        // 尾巴排空再收尾，因此 onFinished 会比按下停止晚 drainMs 到达（界面早已是 stopped）。
+        recorder->Stop(drainMs);
     }
     // 状态在 onFinished 里置 stopped，这里先不重复发
 }
@@ -961,6 +974,7 @@ void MediaStreamEngine::OnEncodedVideo(const uint8_t *data, int32_t size, int64_
 }
 
 void MediaStreamEngine::OnEncodedAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
+    lastAudioPtsUs_.store(ptsUs, std::memory_order_relaxed);
     std::shared_ptr<RtmpClient> rtmp = RtmpSnapshotLocked();
     if (rtmp) {
         rtmp->SendAudio(data, size, ptsUs);
@@ -1045,7 +1059,10 @@ void MediaStreamEngine::StartMuxerLocked() {
     };
     int w = videoEncoder_ ? videoEncoder_->Width() : 720;
     int h = videoEncoder_ ? videoEncoder_->Height() : 1280;
-    if (!mp4Recorder_->Start(videosDir_, w, h, avcC_, ascForMuxer, std::move(mcb))) {
+    // 零点：用户按下录制的这一刻（会话相对 μs）。录制是「中途挂上来」的输出，音频链路的内容
+    // 积压会让最先到达的音频样本带着「录制之前」的时间戳，绝不能用它定零点。
+    int64_t basePtsUs = SessionRelativeNs(NowNs()) / 1000;
+    if (!mp4Recorder_->Start(videosDir_, w, h, avcC_, ascForMuxer, basePtsUs, std::move(mcb))) {
         mp4Recorder_.reset();
         pendingRecord_ = false;
         recordState_ = "error";
@@ -1053,6 +1070,12 @@ void MediaStreamEngine::StartMuxerLocked() {
         return;
     }
     mp4Started_ = true;
+    // 先强制请求一个 IDR：录制起点落在 GOP 中间时，视频轨头几个样本没有参考帧 → 播放器
+    // 开头读不出画面（实测头 3.0s/18 个样本不可解码）。请求放在补帧之前，使补投的这
+    // 一帧就是关键帧，播放器一开头就能解码出「界面计时 0:00」的画面。
+    if (videoEncoder_) {
+        videoEncoder_->RequestKeyFrameNow();
+    }
     // 录制起点补帧：屏幕静止时采集侧不产帧，补投缓存帧让视频轨从 0 就有画面
     SubmitLastFrameLocked("record");
     // muxer 已启动：把等待 ASC 期间缓存的视频帧灌入写队列（flush）

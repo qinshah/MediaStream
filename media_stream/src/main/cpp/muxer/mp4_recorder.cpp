@@ -29,6 +29,13 @@ static constexpr int64_t kFirstPtsWaitMs = 220;
 // 归零点待定期间允许缓存的最大样本数（防内存膨胀；正常 220ms 窗口内远达不到）
 static constexpr size_t kMaxPendingFirst = 96;
 
+// 等首个视频关键帧的上限：引擎挂录制时已强制请求 IDR，正常几十毫秒就到。超时则放行，
+// 宁可开头画面有损，也不能整段没有录制。
+static constexpr int64_t kIdrWaitMs = 1500;
+// 停止时排空音频尾巴的上限。音频链路（采集→混音→AAC 编码器输入队列）积压实测 0.3~1.4s，
+// 超过这个值就不再等：宁可截掉一点尾巴也不能让文件迟迟不落盘。
+static constexpr int64_t kMaxAudioDrainMs = 2000;
+
 static int64_t NowSteadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -40,8 +47,8 @@ Mp4Recorder::~Mp4Recorder() {
 }
 
 bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const std::vector<uint8_t> &avcC,
-                        const std::vector<uint8_t> &asc, Callbacks callbacks) {
-    if (recording_.exchange(true)) {
+                        const std::vector<uint8_t> &asc, int64_t basePtsUs, Callbacks callbacks) {
+    if (accepting_.exchange(true)) {
         MS_LOG_WARN("Mp4Recorder already recording, ignore Start");
         return true;
     }
@@ -50,17 +57,31 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     height_ = height;
     avcC_ = avcC;
     asc_ = asc;
+    recording_.store(true);
     stopRequested_ = false;
     storageError_ = false;
     finished_ = false;
     writeThreadDone_ = false;
-    firstPtsUs_ = -1;
-    firstSealed_ = false;
+    // 时间轴零点：由调用方在「用户按下录制」那一刻确定（会话相对 μs），不再等两轨首样本取 min。
+    // 原因（真机实测）：音频链路有 0.3~1.4s 内容积压，中途挂上来的录制最先收到的是「内容时间
+    // 早于录制起点」的音频样本。取 min 会把零点一起拖回去 —— 实测被拖 1.357s，后果是：
+    //   1) 文件开头 1.357s 只有「录制之前」的音频，画面冻在第一帧（界面计时已到 0:01，不是 0:00）；
+    //   2) 整条音轨相对画面偏 1.357s（音画不同步）；
+    //   3) 文件比真实录制长 1.357s，且尾部 1.4s 只剩画面没声音。
+    // 现在零点固定=录制起点，早于它的样本按 MP4-EARLY 丢弃（那些内容本就不属于这次录制）。
+    firstPtsUs_.store(basePtsUs);
+    firstSealed_ = (basePtsUs >= 0);
     firstVideoIn_ = false;
     firstAudioIn_ = false;
     pendingFirst_.clear();
     pendingFirstStartMs_ = 0;
     droppedEarly_ = 0;
+    videoStarted_.store(false);
+    videoOpen_.store(true);
+    videoGateStartMs_ = NowSteadyMs();
+    droppedNoIdr_ = 0;
+    draining_.store(false);
+    drainUntilMs_.store(0);
     lastPtsUs_ = 0;
     stopSteadyMs_ = 0;
     writtenBytes_ = 0;
@@ -180,6 +201,9 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
         return false;
     }
 
+    MS_LOG_WARN("[MP4-BASE] fixed basePtsUs=%{public}lld (录制起点，零点由引擎给定)",
+                static_cast<long long>(basePtsUs));
+
     queue_ = std::make_unique<BoundedQueue<Sample>>(kWriteQueueCap, OverflowPolicy::kBlockOnFull);
     writeThread_ = std::thread(&Mp4Recorder::WriteThreadMain, this);
     MS_LOG_INFO("Mp4Recorder started: %{public}s", filePath_.c_str());
@@ -192,8 +216,28 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
 static constexpr int64_t kWritePushTimeoutMs = 150; // 150ms 内没腾出空间则丢当前编码帧
 
 void Mp4Recorder::WriteVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe) {
-    if (!recording_.load() || stopRequested_.load() || data == nullptr || size <= 0) {
+    if (!accepting_.load() || !videoOpen_.load() || data == nullptr || size <= 0) {
         return;
+    }
+    // 视频轨首个样本必须是同步样本（关键帧）：否则文件开头没有参考帧，播放器读不出画面。
+    // 真机实测（先推流后录制）：录制起点落在 GOP 中间，轨道头 18 个样本 约 3.0s 全部不可解码，
+    // ffmpeg 报 "Missing key frame while searching for timestamp: 0"，47 个样本只解出 29 帧；
+    // 播放器只能黑屏/卡在第一帧，界面计时自然也不是从 0:00 开始。引擎在挂录制时已强制请求
+    // IDR，这里再兜一道；等不到 IDR 也不能整段没画面，超时放行并告警。
+    if (!videoStarted_.load()) {
+        if (!isKeyframe) {
+            if (NowSteadyMs() - videoGateStartMs_ < kIdrWaitMs) {
+                int64_t n = droppedNoIdr_.fetch_add(1) + 1;
+                if (n <= 3) {
+                    MS_LOG_WARN("[MP4] video gate: drop non-sync sample while waiting IDR (n=%{public}lld)",
+                                static_cast<long long>(n));
+                }
+                return;
+            }
+            MS_LOG_WARN("video gate: no IDR within %{public}lld ms, start video track with non-sync sample",
+                        static_cast<long long>(kIdrWaitMs));
+        }
+        videoStarted_.store(true);
     }
     Sample s;
     s.data.assign(data, data + size);
@@ -209,7 +253,7 @@ void Mp4Recorder::WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
     if (audioTrack_ < 0) {
         return; // 无音频轨（系统内录无 ASC）
     }
-    if (!recording_.load() || stopRequested_.load() || data == nullptr || size <= 0) {
+    if (!accepting_.load() || data == nullptr || size <= 0) {
         return;
     }
     Sample s;
@@ -239,11 +283,31 @@ int64_t Mp4Recorder::DurationMs() const {
     return stop > start ? stop - start : 0;
 }
 
-void Mp4Recorder::Stop() {
-    if (!recording_.exchange(false) && stopRequested_.load()) {
+void Mp4Recorder::Stop(int64_t audioDrainMs) {
+    if (stopRequested_.exchange(true)) {
         return; // 已停止过（幂等）
     }
-    stopRequested_ = true;
+    // 视频轨立即关闭：排空只针对音频尾巴。若视频继续写入，文件尾部会多出「按下停止之后」的
+    // 几秒画面，等于把「结尾只有画面没声音」换成「多一段停止后的画面」——两头都没修好。
+    videoOpen_.store(false);
+    // 时长定格在「用户按下停止」这一刻：此后写线程只是把在途样本与音频尾巴排空，不再代表
+    // 真实录制内容。这样界面/事件里的时长与文件内容（约等于停止时刻）一致。
+    {
+        int64_t expect = 0;
+        stopSteadyMs_.compare_exchange_strong(expect, NowSteadyMs());
+    }
+    // 音频尾巴排空：音频链路里还有 0.3~1.4s 已经采集、但尚未从编码器/队列出来的声音。
+    // 立刻 Close 会让文件尾部丢掉这段时间的音频 —— 表现就是「结尾画面还在动，但没有声音」。
+    // 因此保留音频写入一段有界时间，由写线程到点后自行收尾。
+    if (audioDrainMs > 0 && hasAudioTrack_) {
+        int64_t d = audioDrainMs > kMaxAudioDrainMs ? kMaxAudioDrainMs : audioDrainMs;
+        drainUntilMs_.store(NowSteadyMs() + d);
+        draining_.store(true);
+        MS_LOG_WARN("mp4 Stop: drain audio tail %{public}lld ms before finalize (video closed now)",
+                    static_cast<long long>(d));
+        return;
+    }
+    accepting_.store(false);
     if (queue_) {
         queue_->Close(); // 唤醒写线程，排空后退出
     }
@@ -398,13 +462,36 @@ bool Mp4Recorder::WriteSampleNow(const Sample &sample) {
 }
 
 void Mp4Recorder::WriteThreadMain() {
-    // 排空队列（Close 后 Pop 在排空后返回 false）
+    // 排空队列。两种模式：
+    //  - 常规：Pop 阻塞；Close 且排空后返回 false → 退出。
+    //  - 音频尾巴排空（Stop 带 drain）：PopTimed 轮询，到 drainUntilMs_ 后退出。必须带超时：
+    //    排空期间音频若真断流（用户紧接着又停了推流），阻塞 Pop 会让文件永远不落盘。
     Sample s;
-    while (queue_ && queue_->Pop(s)) {
-        if (!WriteOneSample(s)) {
+    for (;;) {
+        bool got = false;
+        if (draining_.load()) {
+            if (!queue_) {
+                break;
+            }
+            got = queue_->PopTimed(s, 30);
+            if (!got && NowSteadyMs() >= drainUntilMs_.load()) {
+                MS_LOG_WARN("audio drain deadline reached, finalize (in-flight=%{public}zu)",
+                            queue_->Size());
+                break;
+            }
+        } else {
+            if (!queue_ || !queue_->Pop(s)) {
+                break; // Close 且排空
+            }
+            got = true;
+        }
+        if (got && !WriteOneSample(s)) {
             break; // 存储错误：停止写入，走异常收尾
         }
     }
+    // 收尾：不再接受写入（视频在 Stop 时已关，音频排空到点也关）
+    accepting_.store(false);
+    draining_.store(false);
     // 极短录制兜底：队列排空时若另一轨首样本始终没来，归零点仍未定，这里补一次落盘
     if (!pendingFirst_.empty()) {
         SealFirstPtsLocked();
@@ -420,9 +507,19 @@ void Mp4Recorder::WriteThreadMain() {
     // 安全收尾：Stop 写 moov → Destroy → close(fd)
     // 先定格录制时长：这一刻之后不再代表真实录制内容（后面只是封装收尾），
     // 也让 onFinished 给出的 durationMs 与界面上的终值完全一致。
-    stopSteadyMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count());
+    {
+        // 时长终值：Stop() 已按「用户按下停止那一刻」定格；只有从未定格过（异常路径）才在此补。
+        int64_t expect = 0;
+        stopSteadyMs_.compare_exchange_strong(
+            expect, std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+    }
+    recording_.store(false);
+    MS_LOG_INFO("mp4 tail stats: samples=%{public}lld droppedEarly=%{public}lld droppedNoIdr=%{public}lld",
+                static_cast<long long>(writtenSamples_.load()),
+                static_cast<long long>(droppedEarly_.load()),
+                static_cast<long long>(droppedNoIdr_.load()));
     if (muxer_ != nullptr) {
         MS_LOG_WARN("[MUX] OH_AVMuxer_Stop before (moov)");
         int32_t s = OH_AVMuxer_Stop(muxer_);

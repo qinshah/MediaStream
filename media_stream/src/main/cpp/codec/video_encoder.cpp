@@ -253,6 +253,24 @@ void VideoEncoder::Stop() {
     }
 }
 
+void VideoEncoder::RequestKeyFrameNow() {
+    OH_AVCodec *enc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        enc = encoder_;
+    }
+    if (enc == nullptr || !aliveFlag_.load()) {
+        MS_LOG_WARN("force IDR request skipped (encoder unavailable)");
+        return;
+    }
+    int64_t before = lastKeyReqMs_.load();
+    lastKeyReqMs_.store(0); // 清掉节流窗口，确保下面的请求一定发得出去
+    MaybeRequestKeyFrame(enc);
+    // before 是 steady 时钟的绝对 ms（不是「多久以前」），0 表示本会话尚未请求过
+    MS_LOG_WARN("force IDR requested (prev req at steadyMs=%{public}lld, 0=本会话首次)",
+                static_cast<long long>(before));
+}
+
 void VideoEncoder::MaybeRequestKeyFrame(OH_AVCodec *enc) {
     if (enc == nullptr || !aliveFlag_.load()) {
         return;
