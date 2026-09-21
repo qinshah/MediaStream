@@ -94,12 +94,19 @@ export struct ConsoleView {
 
       Scroll() {
         Column({ space: 16 }) {
-          // —— 推流地址 ——
-          TextInput({ placeholder: 'rtmp://服务器/app/stream', text: this.vm.rtmpUrl })
+          // —— 推流地址 + 推流码（分两段填，对齐抖音/B站的给法；推流时拼成完整 URL）——
+          TextInput({ placeholder: '推流地址 rtmp://服务器/app', text: this.vm.rtmpUrl })
             .width('100%')
             .enabled(!this.vm.settingsLocked)
             .onChange((v: string) => {
               this.vm.rtmpUrl = v;
+            })
+
+          TextInput({ placeholder: '推流码 stream key', text: this.vm.streamKey })
+            .width('100%')
+            .enabled(!this.vm.settingsLocked)
+            .onChange((v: string) => {
+              this.vm.streamKey = v;
             })
 
           // —— 画质预设 ——
@@ -202,20 +209,17 @@ export struct ConsoleView {
       .layoutWeight(1)
       .padding({ left: 16, right: 16 })
 
-      // —— 统计面板（录制时长单列展示）——
+      // —— 统计面板：fps / 码率 / 推流时长 / 录制时长 ——
       Column({ space: 4 }) {
         Row({ space: 16 }) {
           // 注意：这里必须用「无参 @Builder」而非 statItem(label, value) 形式。
           // @Builder 的值参数是快照，@Trace 字段变化后不会重算，统计会永远停在初值 0
-          // （真机现象：内联的「推流时长」正常刷新，而同区域的 fps/码率/已发恒为 0）。
+          // （真机现象：内联的「推流时长」正常刷新，而同区域的 fps/码率恒为 0）。
           this.statFps()
           this.statBitrate()
-          this.statSent()
+          this.statStreamDuration()
           this.statRecord()
         }
-        Text(`推流时长 ${this.vm.streamDuration}`)
-          .fontSize(12)
-          .fontColor('#888888')
       }
       .width('100%')
       .padding(16)
@@ -393,13 +397,15 @@ export struct ConsoleView {
     }
   }
 
+  // 「已发 KB」改为推流时长：累计字节对使用者没有决策价值，而时长是推流时的核心信息。
+  // 数值由原生给出（运行中实时推进；停止/出错时由停止回调冻结终值，不会中断后还在涨）。
   @Builder
-  statSent() {
+  statStreamDuration() {
     Column({ space: 2 }) {
-      Text(`${this.vm.sentBytes} KB`)
+      Text(this.vm.streamDuration)
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
-      Text('已发')
+      Text('推流时长')
         .fontSize(11)
         .fontColor('#888888')
     }
@@ -411,7 +417,7 @@ export struct ConsoleView {
       Text(this.vm.recordDuration)
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
-      Text('录制')
+      Text('录制时长')
         .fontSize(11)
         .fontColor('#888888')
     }

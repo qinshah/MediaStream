@@ -11,6 +11,7 @@ import {
   StreamSettings,
   RecordingMeta,
   SessionStats,
+  composeRtmpUrl,
 } from '../service/MediaStreamService';
 import { ErrorCode } from 'media_stream';
 import { PreferencesRepository } from '../data/PreferencesRepository';
@@ -23,9 +24,11 @@ import { errorMessage } from '../model/Types';
 const DOMAIN = 0x0000;
 const TAG = 'ConsoleViewModel';
 
-// 默认推流地址：指向 Mac 上 node-media-server 起的局域网 RTMP 服务（rtmp://<mac-ip>:1935/live/stream）。
+// 默认推流地址：指向 Mac 上 node-media-server 起的局域网 RTMP 服务。
+// 按「推流地址 + 推流码」拆开给（对齐抖音/B站），拼接后即 rtmp://192.168.43.10/live/stream。
 // 便于“打开即点推流”完成闭环测试；用户仍可在输入框改成任意地址，改后持久化覆盖默认值。
-const DEFAULT_RTMP_URL = 'rtmp://192.168.43.10/live/stream';
+const DEFAULT_RTMP_ADDR = 'rtmp://192.168.43.10/live';
+const DEFAULT_STREAM_KEY = 'stream';
 
 // 事件监听器：把原生/服务的状态事件镜像进 viewmodel 的可观测字段
 class ConsoleListener implements MediaStreamEventListener {
@@ -67,7 +70,9 @@ class ConsoleListener implements MediaStreamEventListener {
 @ObservedV2
 export class ConsoleViewModel {
   // —— 配置（可编辑，变更即持久化；会话进行中锁定）——
-  @Trace rtmpUrl: string = DEFAULT_RTMP_URL;
+  @Trace rtmpUrl: string = DEFAULT_RTMP_ADDR;
+  // 推流码（流名）：与推流地址分开填写，推流时拼成完整 RTMP URL 交给原生。
+  @Trace streamKey: string = DEFAULT_STREAM_KEY;
   @Trace preset: string = '720p';
   @Trace fps: number = 30;
   @Trace videoBitrateKbps: number = 4000;
@@ -82,9 +87,8 @@ export class ConsoleViewModel {
   // —— 统计面板 ——
   @Trace streamFps: string = '0';
   @Trace streamBitrate: string = '0';
-  @Trace sentBytes: string = '0';
-  @Trace streamDuration: string = '0s';
-  @Trace recordDuration: string = '0s';
+  @Trace streamDuration: string = '0:00';
+  @Trace recordDuration: string = '0:00';
   @Trace reconnectAttempt: number = 0;
   // 推流地址连通性预检中（按钮显示「检测服务器…」并禁止重复点击）
   @Trace probing: boolean = false;
@@ -135,12 +139,32 @@ export class ConsoleViewModel {
 
   async loadConfig(): Promise<void> {
     const loaded = await PreferencesRepository.getInstance().load();
+    let addr = loaded.rtmpUrl.trim();
+    let key = loaded.streamKey.trim();
+    // 兼容旧配置：加入推流码之前，「地址 + 推流码」是整串存在 rtmpUrl 里的
+    // （如 rtmp://host/live/stream）。若尚未单独存过推流码，且地址带两段以上路径，
+    // 就把最后一段拆成推流码，避免升级后拼成 .../stream/stream 推错流。
+    if (key.length === 0 && addr.length > 0) {
+      const schemeEnd = addr.indexOf('://');
+      const pathStart = schemeEnd >= 0 ? addr.indexOf('/', schemeEnd + 3) : -1;
+      const lastSlash = addr.lastIndexOf('/');
+      if (pathStart > 0 && lastSlash > pathStart && lastSlash < addr.length - 1) {
+        key = addr.substring(lastSlash + 1);
+        addr = addr.substring(0, lastSlash);
+      }
+    }
     // 未配置过（或存的是空串）时回落到局域网默认地址，保证“直接点推流”可测
-    this.rtmpUrl = loaded.rtmpUrl.trim().length === 0 ? DEFAULT_RTMP_URL : loaded.rtmpUrl;
+    this.rtmpUrl = addr.length === 0 ? DEFAULT_RTMP_ADDR : addr;
+    this.streamKey = key.length === 0 ? DEFAULT_STREAM_KEY : key;
     this.preset = loaded.preset;
     this.fps = loaded.fps;
     this.videoBitrateKbps = loaded.videoBitrateKbps;
     this.audioMode = loaded.audioMode === '' ? 'inner' : loaded.audioMode;
+  }
+
+  // 拼接后的完整推流地址（推流地址 + 推流码），预检与展示都以它为准
+  buildRtmpUrl(): string {
+    return composeRtmpUrl(this.rtmpUrl, this.streamKey);
   }
 
   // 变更即持久化（US5）
@@ -150,6 +174,7 @@ export class ConsoleViewModel {
     }
     const s = new StreamSettings();
     s.rtmpUrl = this.rtmpUrl;
+    s.streamKey = this.streamKey;
     s.preset = this.preset;
     s.fps = this.fps;
     s.videoBitrateKbps = this.videoBitrateKbps;
@@ -188,7 +213,8 @@ export class ConsoleViewModel {
   }
 
   startStream(): void {
-    const target: RtmpTarget | null = parseRtmpTarget(this.rtmpUrl);
+    // 预检与推流都以「地址 + 推流码」拼接后的完整 URL 为准
+    const target: RtmpTarget | null = parseRtmpTarget(this.buildRtmpUrl());
     if (target === null) {
       this.errorText = errorMessage(ErrorCode.RTMP_URL_INVALID);
       return;
@@ -344,6 +370,7 @@ export class ConsoleViewModel {
     await BackgroundTaskService.getInstance().start(ctx);
     const s = new StreamSettings();
     s.rtmpUrl = this.rtmpUrl;
+    s.streamKey = this.streamKey;
     s.preset = this.preset;
     s.fps = this.fps;
     s.videoBitrateKbps = this.videoBitrateKbps;
@@ -384,10 +411,18 @@ export class ConsoleViewModel {
   }
 
   applyStreamState(state: StreamStatus): void {
+    const wasActive = this.isStreamingActive(); // 用「变更前」的状态判断这是否是一轮新会话
     this.streamStatus = state;
+    if (state === StreamStatus.CONNECTING && !wasActive) {
+      // 新一轮推流：时长与速率归零（时长终值由停止回调冻结后推来）。
+      // 重连时不做归零，否则每次重连显示都会闪回 0:00。
+      this.streamDuration = '0:00';
+      this.streamFps = '0';
+      this.streamBitrate = '0';
+    }
     // 推流结束后统计线程不再上报，fps/码率会停在最后一帧的值（真机现象：已停止仍显示 12fps/617kbps）。
-    // 「已发」由 sentBytes 的绝对值体现不受影响，这里只清零瞬时速率。
-    if (state === StreamStatus.IDLE || state === StreamStatus.STOPPED) {
+    // 但录制还在跑时编码器仍在出帧，此时不能清零（否则纯录制场景的速率显示会一直被推流状态带没了）。
+    if ((state === StreamStatus.IDLE || state === StreamStatus.STOPPED) && !this.isRecordingActive()) {
       this.streamFps = '0';
       this.streamBitrate = '0';
     }
@@ -396,14 +431,17 @@ export class ConsoleViewModel {
 
   applyRecordState(state: RecordStatus): void {
     this.recordStatus = state;
+    if (state === RecordStatus.RECORDING) {
+      this.recordDuration = '0:00'; // 新一段录制从 0 起算（终值由 onFinished 推来）
+    }
     this.updateLocked();
   }
 
   applyStats(stats: SessionStats): void {
-    // 瞬时速率只在推流进行中更新：停止时刻还会有一个「在途」的 stats 事件到达，
-    // 若照单全收会把 applyStreamState 里刚清零的 fps/码率又填回最后一帧的值，
-    // 表现为「已停止但仍显示 720kbps」。（已发/时长是累计量，不受此限制。）
-    if (this.isStreamingActive()) {
+    // 瞬时速率只在「有输出在跑」时更新：只要推流或录制任一路活跃，编码器就在出帧，速率就该刷新
+    // （此前只认 isStreamingActive()，导致纯录制时下方 fps/码率永远不动）。
+    // 两路都停时清零，顺带处理停止后那个「在途」的 stats 事件（否则会把刚清零的值又填回去）。
+    if (this.isStreamingActive() || this.isRecordingActive()) {
       const fpsVal = stats.videoFps;
       if (typeof fpsVal === 'number') {
         this.streamFps = fpsVal.toFixed(0);
@@ -412,11 +450,12 @@ export class ConsoleViewModel {
       if (typeof bitVal === 'number') {
         this.streamBitrate = bitVal.toFixed(0);
       }
+    } else {
+      this.streamFps = '0';
+      this.streamBitrate = '0';
     }
-    const sentVal = stats.sentBytes;
-    if (typeof sentVal === 'number') {
-      this.sentBytes = (sentVal / 1024).toFixed(1);
-    }
+    // 时长一律照收：数值只由原生在「运行中」或「停止回调里冻结」时给出，
+    // 不会出现中断后还在涨的情况，UI 侧无需再加门控。
     const sd = stats.streamDurationMs;
     if (typeof sd === 'number' && sd > 0) {
       this.streamDuration = this.formatMs(sd);

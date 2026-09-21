@@ -44,11 +44,42 @@ export class Browser {
   first: number = 0;
 }
 export class StreamSettings {
-  rtmpUrl: string = '';
+  rtmpUrl: string = '';   // 推流地址（到 app 段，如 rtmp://host/live）
+  streamKey: string = ''; // 推流码（流名，如 stream）
   preset: string = '720p';
   fps: number = 30;
   videoBitrateKbps: number = 4000;
   audioMode: string = 'inner';
+}
+
+// 去除首尾空白与尾部斜杠（地址侧）
+function trimEndSlash(s: string): string {
+  let r = s.trim();
+  while (r.length > 0 && r.charAt(r.length - 1) === '/') {
+    r = r.substring(0, r.length - 1);
+  }
+  return r;
+}
+
+// 去除首尾空白与前导斜杠（推流码侧）
+function trimStartSlash(s: string): string {
+  let r = s.trim();
+  while (r.length > 0 && r.charAt(0) === '/') {
+    r = r.substring(1);
+  }
+  return r;
+}
+
+// 拼接完整 RTMP URL：推流地址 + '/' + 推流码（对齐抖音/B站「推流地址 + 推流码」的分段给法）。
+// 两侧斜杠做规整，避免出现 //；推流码为空时按地址原样使用（兼容地址里已含完整路径的老配置）。
+// 原生 RtmpClient 只认完整 URL，拆分与拼接全部在本层完成，原生侧无需改动。
+export function composeRtmpUrl(rtmpUrl: string, streamKey: string): string {
+  const addr = trimEndSlash(rtmpUrl);
+  const key = trimStartSlash(streamKey);
+  if (key.length === 0) {
+    return addr;
+  }
+  return `${addr}/${key}`;
 }
 
 // 录制产物元数据（用于列表展示）
@@ -140,7 +171,7 @@ export class MediaStreamService {
     try {
       // preset 映射短边目标值（原生侧已按预设解释）
       native.startStreaming({
-        rtmpUrl: settings.rtmpUrl,
+        rtmpUrl: composeRtmpUrl(settings.rtmpUrl, settings.streamKey),
         preset: settings.preset as ResolutionPreset,
         fps: settings.fps,
         videoBitrateKbps: settings.videoBitrateKbps,
@@ -170,7 +201,7 @@ export class MediaStreamService {
       // 录制必须携带会话配置（尤其 audioMode），否则原生侧沿用陈旧/默认配置导致麦克风等音频源未启用
       if (settings) {
         native.startRecording({
-          rtmpUrl: settings.rtmpUrl,
+          rtmpUrl: composeRtmpUrl(settings.rtmpUrl, settings.streamKey),
           preset: settings.preset as ResolutionPreset,
           fps: settings.fps,
           videoBitrateKbps: settings.videoBitrateKbps,

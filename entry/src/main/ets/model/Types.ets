@@ -70,7 +70,7 @@ export function errorMessage(code: number): string {
     case ErrorCode.ENCODER_ERROR:
       return '视频编码发生异常';
     case ErrorCode.RTMP_URL_INVALID:
-      return '推流地址格式不正确，需以 rtmp:// 开头';
+      return '推流地址格式不正确，需形如 rtmp://服务器/app，并填写推流码';
     case ErrorCode.RTMP_CONNECT_FAIL:
       return '无法连接到推流服务器';
     case ErrorCode.RTMP_TIMEOUT:
