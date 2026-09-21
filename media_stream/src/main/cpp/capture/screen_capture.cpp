@@ -57,6 +57,11 @@ bool ScreenCapture::Start(const Config &config, Callbacks callbacks) {
     frameFormat_.store(0);
     lastVideoNs_.store(0);
     wantNv12_.store(true);
+    probeRecv_.store(0);
+    probePass_.store(0);
+    probeLastLogNs_.store(0);
+    probeWinRecv_.store(0);
+    probeWinPass_.store(0);
 
     capture_ = OH_AVScreenCapture_Create();
     if (capture_ == nullptr) {
@@ -161,13 +166,14 @@ static void OnBufferAvailable(OH_AVScreenCapture *capture, OH_AVBuffer *buffer,
     (void)timestamp; // 单位不可靠，统一取到达时刻
     auto *self = static_cast<ScreenCapture *>(userData);
     if (self == nullptr || buffer == nullptr) {
-        if (buffer != nullptr) {
-            OH_AVBuffer_Destroy(buffer);
-        }
         return;
     }
+    // 缓冲所有权归框架：SetDataCallback 文档原文「After the callback is triggered, the buffer is
+    // no longer valid」，框架在回调返回后自行回收，官方示例全程一次都未释放。
+    // 此处**绝不能** OH_AVBuffer_Destroy —— 销毁非本进程创建的 buffer 会打乱框架缓冲池记账，
+    // 真机实测后果：①投递被压到 recv≈2 帧/5s（0.4fps，视频几乎静止）；
+    // ②缓冲内容被提前回收清零（Y 平面底部整段读到 0，U=V=0 → 解码成纯绿块）。
     if (!self->IsRunning()) {
-        OH_AVBuffer_Destroy(buffer);
         return;
     }
     switch (bufferType) {
@@ -180,12 +186,9 @@ static void OnBufferAvailable(OH_AVScreenCapture *capture, OH_AVBuffer *buffer,
         case OH_SCREEN_CAPTURE_BUFFERTYPE_AUDIO_MIC:
             if (self->IsUsingMic()) {
                 self->HandleAudioBuffer(buffer, true);
-            } else {
-                OH_AVBuffer_Destroy(buffer);
             }
             break;
         default:
-            OH_AVBuffer_Destroy(buffer);
             break;
     }
 }
@@ -200,16 +203,59 @@ static void OnError(OH_AVScreenCapture *capture, int32_t errorCode, void *userDa
 }
 
 static void OnStateChange(OH_AVScreenCapture *capture, OH_AVScreenCaptureStateCode stateCode, void *userData) {
-    (void)capture;
     auto *self = static_cast<ScreenCapture *>(userData);
     MS_LOG_INFO("AVScreenCapture state -> %{public}d", static_cast<int>(stateCode));
     if (self == nullptr) {
+        return;
+    }
+    if (stateCode == OH_SCREEN_CAPTURE_STATE_STARTED) {
+        // 系统真正开跑（授权弹窗 + 录屏服务拉起完成）后的唯一时机：限制投递帧率上限。
+        // 顺带这是「StartScreenCapture 返回到首帧到达」之间空窗期的结束标志（实测 6~10s）。
+        self->ApplyMaxFrameRate(capture);
+        // 同时作为「音频/视频多久没数据」类超时判定的时间基准：Start() 返回时用户还没授权，
+        // 以它为基准会让判定在授权前就超时（实测空窗 12~14s）
+        self->DispatchStarted();
         return;
     }
     if (stateCode == static_cast<OH_AVScreenCaptureStateCode>(kStateStoppedByUser) ||
         stateCode == static_cast<OH_AVScreenCaptureStateCode>(kStateStoppedByUserSwitches)) {
         self->DispatchUserStopped();
     }
+}
+
+void ScreenCapture::ApplyMaxFrameRate(OH_AVScreenCapture *capture) {
+    if (capture == nullptr || fps_ <= 0) {
+        return;
+    }
+    int32_t rc = OH_AVScreenCapture_SetMaxVideoFrameRate(capture, fps_);
+    MS_LOG_INFO("SetMaxVideoFrameRate(%{public}d) rc=%{public}d", fps_, rc);
+}
+
+void ScreenCapture::ProbeVideoFrame(int64_t nowNs, bool passed) {
+    probeRecv_.fetch_add(1, std::memory_order_relaxed);
+    if (passed) {
+        probePass_.fetch_add(1, std::memory_order_relaxed);
+    }
+    int64_t lastLog = probeLastLogNs_.load(std::memory_order_relaxed);
+    if (lastLog == 0) {
+        int64_t expected = 0;
+        probeLastLogNs_.compare_exchange_strong(expected, nowNs);
+        return;
+    }
+    if (nowNs - lastLog < 5000000000LL) {
+        return;
+    }
+    // 抢占式更新窗口起点：多路径回调并发时只让一个线程打印
+    if (!probeLastLogNs_.compare_exchange_strong(lastLog, nowNs)) {
+        return;
+    }
+    int64_t recv = probeRecv_.load(std::memory_order_relaxed);
+    int64_t pass = probePass_.load(std::memory_order_relaxed);
+    int64_t dRecv = recv - probeWinRecv_.exchange(recv, std::memory_order_relaxed);
+    int64_t dPass = pass - probeWinPass_.exchange(pass, std::memory_order_relaxed);
+    MS_LOG_INFO("[SC-PROBE] recv=%{public}lld(%{public}lld/s) pass=%{public}lld(%{public}lld/s) fps=%{public}d",
+                static_cast<long long>(dRecv), static_cast<long long>(dRecv / 5),
+                static_cast<long long>(dPass), static_cast<long long>(dPass / 5), fps_);
 }
 
 // —— 视频缓冲处理：节流 → 格式探测 → 行距紧凑化 → 回调 → 归还 buffer ——
@@ -222,22 +268,17 @@ void ScreenCapture::HandleVideoBuffer(OH_AVBuffer *buffer) {
         int64_t interval = 1000000000LL / fps_;
         int64_t last = lastVideoNs_.load(std::memory_order_relaxed);
         bool drop = (last != 0 && now - last < interval - interval / 10);
-        static int diagSc = 0;
-        if (diagSc++ < 5) {
-            MS_LOG_WARN("[SC] fps=%{public}d last=%{public}lld now=%{public}lld drop=%{public}d", fps_,
-                        static_cast<long long>(last), static_cast<long long>(now), drop ? 1 : 0);
-        }
         if (drop) {
-            OH_AVBuffer_Destroy(buffer);
+            ProbeVideoFrame(now, false);
             return;
         }
         lastVideoNs_.store(now, std::memory_order_relaxed);
+        ProbeVideoFrame(now, true);
     }
 
     uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
     int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
     if (addr == nullptr || capacity <= 0) {
-        OH_AVBuffer_Destroy(buffer);
         return;
     }
 
@@ -257,11 +298,18 @@ void ScreenCapture::HandleVideoBuffer(OH_AVBuffer *buffer) {
         frameFormat_.store(fmt, std::memory_order_relaxed);
         MS_LOG_INFO("frame format detected: %{public}s (capacity=%{public}d %{public}dx%{public}d)",
                     fmt == 1 ? "RGBA" : fmt == 2 ? "NV12" : "unknown", capacity, w, h);
+        // 源缓冲真实行距探针：行距若按 capacity/h 推断与真值不符，紧凑化会把内容读斜
+        OH_NativeBuffer *nbDbg = OH_AVBuffer_GetNativeBuffer(buffer);
+        if (nbDbg != nullptr) {
+            OH_NativeBuffer_Config nbCfg = {};
+            OH_NativeBuffer_GetConfig(nbDbg, &nbCfg);
+            MS_LOG_WARN("[SC] src buf cfg w=%{public}d h=%{public}d stride=%{public}d fmt=%{public}d usage=%{public}d",
+                        nbCfg.width, nbCfg.height, nbCfg.stride, nbCfg.format, nbCfg.usage);
+        }
     }
     size_t need = fmt == 2 ? static_cast<size_t>(w) * h * 3 / 2 : static_cast<size_t>(w) * h * 4;
     if (fmt == -1 || static_cast<size_t>(capacity) < need) {
-        // 分辨率尚未同步等过渡期：跳帧但必须归还 buffer
-        OH_AVBuffer_Destroy(buffer);
+        // 分辨率尚未同步等过渡期：跳帧（缓冲由框架回收，见 OnBufferAvailable 注释）
         return;
     }
 
@@ -325,8 +373,7 @@ void ScreenCapture::HandleVideoBuffer(OH_AVBuffer *buffer) {
     if (callbacks_.onVideoFrame) {
         callbacks_.onVideoFrame(packed.data(), w, h, fmt == 2, now);
     }
-    // 原始流协议：buffer 用完必须归还，否则缓冲池耗尽后投递停止
-    OH_AVBuffer_Destroy(buffer);
+    // 原始流协议：buffer 归框架所有，回调返回后框架自行回收，应用不得释放
 }
 
 void ScreenCapture::HandleAudioBuffer(OH_AVBuffer *buffer, bool isMic) {
@@ -338,7 +385,7 @@ void ScreenCapture::HandleAudioBuffer(OH_AVBuffer *buffer, bool isMic) {
             cb(addr, capacity, NowNs());
         }
     }
-    OH_AVBuffer_Destroy(buffer);
+    // 同 HandleVideoBuffer：缓冲由框架回收，不得在此释放
 }
 
 } // namespace media_stream
