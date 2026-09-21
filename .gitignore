@@ -12,3 +12,7 @@
 /.appanalyzer
 # 开发期参考克隆（独立 git 仓库），不纳入本工程提交
 /Harmony-OBS-Studio
+# 本地调试产物：录屏诊断截图、设备崩溃 faultdump 备份、自研 mp4/inspection 工具
+/screenshots
+/faultdump
+/debug_tools
