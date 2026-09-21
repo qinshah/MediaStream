@@ -79,6 +79,9 @@ private:
 
     // 采集回调挂接
     void OnCapturedVideo(const uint8_t *data, int width, int height, bool isNv12, int64_t ptsNs);
+    // 预建最近邻采样索引表（尺寸变化时重建），并把 RGBA 单趟转换+缩放到编码尺寸
+    void BuildScaleTables(int sw, int sh, int dw, int dh);
+    void RgbaToNv12Scaled(const uint8_t *src, size_t srcStride, uint8_t *dst);
     void OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs);
     void OnCapturedMicAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs);
     void OnCaptureError(int32_t errorCode);
@@ -150,8 +153,6 @@ private:
         bool isKeyframe = false;
     };
     std::deque<PendingVideoSample> pendingVideo_;
-    int64_t recordRequestSteadyMs_ = 0;  // 录制请求发起时刻（墙钟，用于 ASC 等待超时）
-    static constexpr int64_t kAscWaitTimeoutMs = 1000;
     static constexpr size_t kPendingVideoCap = 120; // 等待期视频缓存上限（~4s@30fps）
 
     // RGBA 兜底转换暂存
@@ -161,6 +162,12 @@ private:
     int encodeWidth_ = 0;
     int encodeHeight_ = 0;
     std::vector<uint8_t> scaleNv12Scratch_;
+
+    // 最近邻采样索引表（目标行/列 → 源行/列）。预建一次即可，避免内层循环里做整数除法：
+    // debug 构建(-O0)下每像素一次除法就能把单帧转换拖到数百毫秒。
+    int scaleTableSrcW_ = 0, scaleTableSrcH_ = 0, scaleTableDstW_ = 0, scaleTableDstH_ = 0;
+    std::vector<int> scaleColIdx_;
+    std::vector<int> scaleRowIdx_;
     
 
     // 统计
@@ -178,10 +185,15 @@ private:
     // 保证 MP4 时长/播放速度正确（编码器透传 pts 恒为 0；按帧号×间隔会因实际帧率≠fps 而失真）
     std::atomic<int64_t> captureLastNs_{0};
     std::atomic<int> dumpFrames_{0}; // [DBG] 采集原始 RGBA 抽样帧计数（限前3帧）
+    std::atomic<int> dbgFrameCtr_{0}; // [DBG] 进编码器缓冲采样计数（降频：每 30 帧一条）
     std::atomic<int64_t> outPtsStartNs_{ -1 };
 
     // 麦克风降级检测
     std::atomic<bool> micDegraded_{false};
+    // 采集真正开始的时刻（steady_clock ns，来自 AVScreenCapture 的 STARTED 回调）。
+    // 必须以此而非管线创建时刻做超时基准：Start() 返回到用户授权存在 12~14s 空窗，
+    // 以管线创建为基准会让「麦克风无数据」判定在用户还没授权时就误报。
+    std::atomic<int64_t> captureActiveNs_{-1};
 };
 
 } // namespace media_stream

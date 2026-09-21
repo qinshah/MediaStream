@@ -14,19 +14,20 @@
 
 namespace media_stream {
 
-// 音频源降级检测阈值：连续 1s 麦克风无数据
-static constexpr int kMicDegradeThresholdMs = 1000;
+// 音频源降级检测阈值：采集真正开始（STARTED）后连续该时长仍无麦克风数据才判定降级。
+// 实测麦克风首帧在 STARTED 后 0.35~0.6s 到达，留足余量取 2.5s，避免偶发迟到的误报。
+static constexpr int kMicDegradeThresholdMs = 2500;
+
+// AAC-LC / 48000Hz / 双声道 的 AudioSpecificConfig（ASC）定值。
+// 位域：audioObjectType=2(AAC-LC, 5bit) | samplingFrequencyIndex=3(48000Hz, 4bit) |
+//       channelConfiguration=2(双声道, 4bit) | frameLengthFlag=0 dependsOnCoreCoder=0
+//       extensionFlag=0(3bit)  →  00010 0011 0010 000 = 0x11 0x90
+// 仅在编码器未回传真实 ASC 时用于兜底（见 StartMuxerLocked）。
+static const std::vector<uint8_t> kDefaultAacAsc = {0x11, 0x90};
 
 // 单调时钟：ns（供 fps 节流与输出 PTS 生成使用）
 static int64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-// 单调时钟：ms（供 ASC 等待超时判定）
-static int64_t NowSteadyMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
@@ -198,6 +199,63 @@ static void ScaleNv12(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, 
     }
 }
 
+static inline uint8_t ClampToU8(int32_t v) {
+    return v < 0 ? 0 : (v > 255 ? 255 : static_cast<uint8_t>(v));
+}
+
+// 单趟整数最近邻：RGBA(sw×sh, srcStride 字节/行) → NV12(dw×dh) 紧凑输出。
+// 合并原「RGBA→NV12（原生尺寸，340 万像素）」+「NV12 双线性缩放（逐像素浮点插值 + lambda）」
+// 两步：只访问真正被采样的 117 万像素，且内层循环零浮点、零除法（索引表预建）。
+// 动机：debug 构建(-O0)下原两步实测 ~283ms/帧，远超 33ms 帧间隔 —— 采集回调被拖住后
+// ①系统按消费速度投递形成背压，有效帧率掉到 3~4fps；②同一回调线程承载的音频缓冲被拖丢，
+// 实测音频轨比视频轨短 10%。
+void MediaStreamEngine::BuildScaleTables(int sw, int sh, int dw, int dh) {
+    if (scaleTableSrcW_ == sw && scaleTableSrcH_ == sh && scaleTableDstW_ == dw && scaleTableDstH_ == dh) {
+        return;
+    }
+    scaleColIdx_.resize(dw);
+    for (int dx = 0; dx < dw; dx++) {
+        int sx = static_cast<int>((static_cast<int64_t>(dx) * sw) / dw);
+        scaleColIdx_[dx] = sx < sw ? sx : sw - 1;
+    }
+    scaleRowIdx_.resize(dh);
+    for (int dy = 0; dy < dh; dy++) {
+        int sy = static_cast<int>((static_cast<int64_t>(dy) * sh) / dh);
+        scaleRowIdx_[dy] = sy < sh ? sy : sh - 1;
+    }
+    scaleTableSrcW_ = sw;
+    scaleTableSrcH_ = sh;
+    scaleTableDstW_ = dw;
+    scaleTableDstH_ = dh;
+}
+
+void MediaStreamEngine::RgbaToNv12Scaled(const uint8_t *src, size_t srcStride, uint8_t *dst) {
+    const int sw = scaleTableSrcW_, sh = scaleTableSrcH_;
+    const int dw = scaleTableDstW_, dh = scaleTableDstH_;
+    uint8_t *dY = dst;
+    uint8_t *dUV = dst + static_cast<size_t>(dw) * dh;
+    for (int dy = 0; dy < dh; dy++) {
+        const uint8_t *srow = src + static_cast<size_t>(scaleRowIdx_[dy]) * srcStride;
+        uint8_t *drow = dY + static_cast<size_t>(dy) * dw;
+        for (int dx = 0; dx < dw; dx++) {
+            const uint8_t *p = srow + static_cast<size_t>(scaleColIdx_[dx]) * 4;
+            drow[dx] = ClampToU8(((66 * p[0] + 129 * p[1] + 25 * p[2]) >> 8) + 16);
+        }
+    }
+    const int dw2 = dw / 2, dh2 = dh / 2;
+    for (int dy = 0; dy < dh2; dy++) {
+        const uint8_t *srow = src + static_cast<size_t>(scaleRowIdx_[dy * 2]) * srcStride;
+        uint8_t *uvRow = dUV + static_cast<size_t>(dy) * dw;
+        for (int dx = 0; dx < dw2; dx++) {
+            const uint8_t *p = srow + static_cast<size_t>(scaleColIdx_[dx * 2]) * 4;
+            uvRow[dx * 2] = ClampToU8(((-38 * p[0] - 74 * p[1] + 112 * p[2]) >> 8) + 128);
+            uvRow[dx * 2 + 1] = ClampToU8(((112 * p[0] - 94 * p[1] - 18 * p[2]) >> 8) + 128);
+        }
+    }
+    (void)sw;
+    (void)sh;
+}
+
 // —— 对外 API ——
 
 bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::string &errMsg) {
@@ -229,6 +287,14 @@ bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::
     EmitStreamState("connecting");
 
     rtmpClient_ = std::make_unique<RtmpClient>();
+    // 推流配置预置：metadata 与音频 ASC 在 publish 成功前就备好，Publish.Start 后立即随控制队列发出。
+    // 音频 ASC 采用「编码器真值优先、未回传则定值兜底」策略（与录制路径一致）：
+    // 部分机型 OH_AudioEncoder 不回传 ASC，若坐等真值会导致推流端无 AAC sequence header → 无声。
+    // 视频 avcC 必须等采集真正出帧（用户授权后）才能补发，由 SetVideoConfig 触发。
+    rtmpClient_->SetAudioConfig(asc_.empty() ? kDefaultAacAsc : asc_);
+    rtmpClient_->SetMetaData(encodeWidth_ > 0 ? encodeWidth_ : 720,
+                             encodeHeight_ > 0 ? encodeHeight_ : 1280, config_.fps,
+                             config_.videoBitrateKbps);
     RtmpClient::Callbacks cb;
     cb.onState = [this](RtmpClient::State state, int attempt) {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -326,7 +392,6 @@ bool MediaStreamEngine::StartRecording(const Config &config, int &errCode, std::
     // 挂起录制并启动 muxer：muxer 需在 AddTrack 前拿到音频 ASC（通常晚于视频 avcC），
     // 因此在 asc 就绪（或等待超时降级仅视频轨）前先把视频帧缓存，避免漏掉音频轨导致录制静音。
     pendingRecord_ = true;
-    recordRequestSteadyMs_ = NowSteadyMs();
     pendingVideo_.clear();
     mp4Started_ = false;
     StartMuxerLocked();
@@ -350,7 +415,6 @@ void MediaStreamEngine::StopRecording() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pendingRecord_ = false;
-        recordRequestSteadyMs_ = 0;
         pendingVideo_.clear(); // muxer 未启动即停止：丢弃缓存的待写视频帧
         // 立即反映停止意图：即使写线程在 OH_AVMuxer 内挂死、onFinished 迟迟不来，
         // 也能让 UI 立刻回到 stopped，避免卡在“录制中”状态（配合 Stop() 非阻塞 detach）。
@@ -437,6 +501,9 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
         config_.audioMode == "mic" ? AudioMixer::Mode::kMicOnly
         : config_.audioMode == "micInner" ? AudioMixer::Mode::kMicAndInner
                                           : AudioMixer::Mode::kInnerOnly);
+    // 每次会话都要重置降级判定；captureActiveNs_ 要等 STARTED 回调（用户授权后）才填
+    micDegraded_ = false;
+    captureActiveNs_.store(-1, std::memory_order_relaxed);
 
     // 编码器先就绪，采集回调进来时可直接投递（以缩小后的可解码编码尺寸启动）
     videoEncoder_ = std::make_unique<VideoEncoder>();
@@ -492,6 +559,7 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
     };
     scb.onError = [this](int32_t code) { OnCaptureError(code); };
     scb.onUserStopped = [this]() { OnCaptureUserStopped(); };
+    scb.onStarted = [this]() { captureActiveNs_.store(NowNs(), std::memory_order_relaxed); };
     if (!capture_->Start({capW, capH, config_.fps, micEnabled, innerEnabled}, std::move(scb))) {
         capture_.reset();
         audioEncoder_.reset();
@@ -529,7 +597,6 @@ void MediaStreamEngine::TeardownPipelineUnlocked() {
         asc_.clear();
         mp4Started_ = false;
         pendingVideo_.clear();
-        recordRequestSteadyMs_ = 0;
     }
     if (cap) {
         cap->Stop();
@@ -577,22 +644,15 @@ void MediaStreamEngine::MaybeStopPipelineUnlocked() {
 
 void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int height, bool isNv12,
                                         int64_t ptsNs) {
-    // 帧率节流：原始流按屏幕刷新率投递（可能远高于目标 fps），在引擎侧再兜底一次，
-    // 控制编码输入速率≈目标 fps（采集回调侧节流在部分设备上不生效，实测仍 ~198fps）。
+    // 帧率节流（兜底洪泛保护）：采集侧已按目标 fps 节流过，这里只防「采集侧节流失效」
+    // 时的洪泛。阈值取半个帧间隔 —— 与采集侧同一门限串联会互相吃掉余量（采集侧刚放行的
+    // 30ms 间隔帧，在引擎侧 30ms 门限下处于临界，抖动即被误丢），故放宽到半间隔。
     int fps = config_.fps > 0 ? config_.fps : 30;
     if (fps > 0) {
         int64_t intervalNs = 1000000000LL / fps;
         int64_t now = NowNs();
         int64_t last = captureLastNs_.load(std::memory_order_relaxed);
-        // 诊断：打印前若干帧的节流判定，确认本分支确实在执行
-        static int diagThr = 0;
-        bool drop = (last != 0 && now - last < intervalNs - intervalNs / 10);
-        if (diagThr++ < 5) {
-            MS_LOG_WARN("[THR] fps=%{public}d interval=%{public}lld last=%{public}lld now=%{public}lld drop=%{public}d",
-                        fps, static_cast<long long>(intervalNs), static_cast<long long>(last),
-                        static_cast<long long>(now), drop ? 1 : 0);
-        }
-        if (drop) {
+        if (last != 0 && now - last < intervalNs / 2) {
             return; // 弃帧，保持目标帧率
         }
         captureLastNs_.store(now, std::memory_order_relaxed);
@@ -611,21 +671,21 @@ void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int heig
         eh = height;
     }
 
-    // 先得到原生尺寸的 NV12（RGBA 时软件转换）
+    // 得到编码尺寸的 NV12
     const uint8_t *nv12 = data;
     if (!isNv12) {
-        size_t need = static_cast<size_t>(width) * height * 3 / 2;
-        if (rgbaToNv12Scratch_.size() < need) {
-            rgbaToNv12Scratch_.resize(need);
+        // RGBA 采集（本设备 SURFACE_YUV Init 被拒后唯一可用通路）：
+        // 单趟整数最近邻直接产出编码尺寸，替代原「原生尺寸转 NV12（340 万像素）
+        // + 浮点双线性缩小」两步。原实现 -O0 实测 ~283ms/帧。
+        size_t need = static_cast<size_t>(ew) * eh * 3 / 2;
+        if (scaleNv12Scratch_.size() < need) {
+            scaleNv12Scratch_.resize(need);
         }
-        extern void RgbaToNv12(const uint8_t *, size_t, int, int, uint8_t *, uint8_t *);
-        RgbaToNv12(data, static_cast<size_t>(width) * 4, width, height, rgbaToNv12Scratch_.data(),
-                   rgbaToNv12Scratch_.data() + static_cast<size_t>(width) * height);
-        nv12 = rgbaToNv12Scratch_.data();
-    }
-
-    // 缩放到编码尺寸（原生 → 16 对齐小尺寸），保证编码流可被播放器解码
-    if (ew != width || eh != height) {
+        BuildScaleTables(width, height, ew, eh);
+        RgbaToNv12Scaled(data, static_cast<size_t>(width) * 4, scaleNv12Scratch_.data());
+        nv12 = scaleNv12Scratch_.data();
+    } else if (ew != width || eh != height) {
+        // 缩放到编码尺寸（原生 → 16 对齐小尺寸），保证编码流可被播放器解码
         if (scaleNv12Scratch_.size() < static_cast<size_t>(ew) * eh * 3 / 2) {
             scaleNv12Scratch_.resize(static_cast<size_t>(ew) * eh * 3 / 2);
         }
@@ -634,9 +694,10 @@ void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int heig
     }
 
     // [DBG] 进编码器前的最终缓冲均值/中心采样（判断是否黑/绿帧）。
-    // 新增色度抽样：绿色=亮Y(正确)+错UV。此处打印原始RGBA中心、缩放后NV12中心Y与UV，
+    // 新增色度抽样：绿色=亮Y(正确)+错UV。打印原始RGBA中心、缩放后NV12中心Y与UV，
     // 一次定位绿色是采集就错(RGBA)还是转换/编码(RGB→UV)错。
-    {
+    // 降频到每 30 帧一条：全帧打印会淹没 hilog 并挤占采集线程。
+    if ((dbgFrameCtr_.fetch_add(1) % 30) == 0) {
         long sum = 0; int n = ew * eh; const uint8_t *p = nv12;
         for (int i = 0; i < n; i += ew) sum += p[i];
         int r0 = p[0], rMid = p[(eh / 2) * ew + (ew / 2)];
@@ -674,14 +735,23 @@ void MediaStreamEngine::OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, 
     if ((innerCtr.fetch_add(1) & 0x3F) == 0) {
         MS_LOG_INFO("[AUD] inner audio bytes=%{public}d total=%{public}d", bytes, innerCtr.load());
     }
-    if (audioEncoder_) {
-        // 双输入由 mixer 混音，单输入直通
-        if (mixer_ && config_.audioMode == "micInner") {
-            mixer_->PushInner(pcm, bytes, ptsNs);
-        } else {
-            audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, ptsNs);
-        }
+    if (audioEncoder_ == nullptr) {
+        return;
     }
+    // 音频路由按会话模式收口：mic 模式下系统仍会投递内录缓冲（audioSource=OH_APP_PLAYBACK），
+    // 若无条件灌进编码器，同一时刻会同时吃掉「内录 + 麦克风」两路 PCM，采样点数翻倍。
+    // 真机实测：音频轨时长 857s vs 视频 521s（1.65 倍），音画必然失步。
+    const std::string &mode = config_.audioMode;
+    if (mode == "micInner") {
+        if (mixer_) {
+            mixer_->PushInner(pcm, bytes, ptsNs);
+        }
+        return;
+    }
+    if (mode == "mic") {
+        return; // 只用麦克风，丢弃内录
+    }
+    audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, ptsNs);
 }
 
 void MediaStreamEngine::OnCapturedMicAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
@@ -690,13 +760,20 @@ void MediaStreamEngine::OnCapturedMicAudio(const uint8_t *pcm, int32_t bytes, in
     if ((micCtr.fetch_add(1) & 0x3F) == 0) {
         MS_LOG_INFO("[AUD] mic audio bytes=%{public}d total=%{public}d", bytes, micCtr.load());
     }
-    if (audioEncoder_) {
-        if (mixer_ && config_.audioMode == "micInner") {
-            mixer_->PushMic(pcm, bytes, ptsNs);
-        } else {
-            audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, ptsNs);
-        }
+    if (audioEncoder_ == nullptr) {
+        return;
     }
+    const std::string &mode = config_.audioMode;
+    if (mode == "micInner") {
+        if (mixer_) {
+            mixer_->PushMic(pcm, bytes, ptsNs);
+        }
+        return;
+    }
+    if (mode != "mic") {
+        return; // inner 模式丢弃麦克风，避免与内录双路叠加
+    }
+    audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, ptsNs);
 }
 
 void MediaStreamEngine::OnCaptureError(int32_t errorCode) {
@@ -813,20 +890,22 @@ void MediaStreamEngine::TryStartPendingRecordLocked() {
 }
 
 void MediaStreamEngine::StartMuxerLocked() {
-    // 真正启动 MP4 封装器的三个前置：
-    //  1) 已有录制请求 pendingRecord_；2) muxer 尚未启动；3) 视频 avcC 已就绪（视频轨必需）。
-    // 音频是可选轨：只要有 ASC 就加音频轨；无 ASC（如内录无播放、音频持续未产出）时在等待
-    // kAscWaitTimeoutMs 后降级为仅视频轨，避免静音录制永远无法开始。
+    // 真正启动 MP4 封装器的前置：1) 已有录制请求 pendingRecord_；2) muxer 尚未启动；
+    // 3) 视频 avcC 已就绪（视频轨必需）。
+    //
+    // 音频轨**必定**建立：OH_AVMuxer_Start 之后无法再补加音轨，所以必须在启动前把音轨定好。
+    // 实测部分机型/版本的 OH_AudioEncoder 既不通过 onStreamChanged 也不通过 CODEC_DATA
+    // 输出帧回传 ASC（AudioSpecificConfig），若坐等 ASC 就只能降级成纯视频轨 —— 结果是
+    // 整场录制无声（真机实测 ffprobe：文件里根本没有音频流）。因此这里改为：编码器回传的
+    // 真值优先，未回传则用本项目固定音频配置（AAC-LC / 48kHz / 双声道）对应的定值 ASC 兜底。
     if (!pendingRecord_ || mp4Started_ || avcC_.empty()) {
         return;
     }
-    if (asc_.empty()) {
-        int64_t waited = NowSteadyMs() - recordRequestSteadyMs_;
-        if (waited < kAscWaitTimeoutMs) {
-            return; // 音频 ASC 未到且未超时：继续缓存视频帧等待音频轨
-        }
-        MS_LOG_WARN("audio ASC not ready within %{public}lldms, record video-only", 
-                    static_cast<long long>(kAscWaitTimeoutMs));
+    std::vector<uint8_t> ascForMuxer = asc_;
+    if (ascForMuxer.empty()) {
+        ascForMuxer = kDefaultAacAsc;
+        MS_LOG_WARN("audio ASC not reported by encoder, use built-in ASC (%{public}zu bytes)",
+                    ascForMuxer.size());
     } else {
         MS_LOG_INFO("StartMuxer with audio ASC %{public}zu bytes", asc_.size());
     }
@@ -859,7 +938,7 @@ void MediaStreamEngine::StartMuxerLocked() {
     };
     int w = videoEncoder_ ? videoEncoder_->Width() : 720;
     int h = videoEncoder_ ? videoEncoder_->Height() : 1280;
-    if (!mp4Recorder_->Start(videosDir_, w, h, avcC_, asc_, std::move(mcb))) {
+    if (!mp4Recorder_->Start(videosDir_, w, h, avcC_, ascForMuxer, std::move(mcb))) {
         mp4Recorder_.reset();
         pendingRecord_ = false;
         recordState_ = "error";
@@ -929,7 +1008,12 @@ void MediaStreamEngine::StatsThreadMain() {
             e.hasDroppedFrames = true;
             e.droppedVideoFrames = rtmpClient_->DroppedVideoFrames();
             if (streamStartMs_ < 0) {
-                streamStartMs_ = 0;
+                // 记下推流真正的起始时刻（steady 毫秒）。此前赋 0 会让「推流时长」变成
+                // steady_clock 自 epoch 起的绝对值（真机实测显示成设备开机时长 32588:48）。
+                streamStartMs_ = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
             }
             e.hasStreamDuration = true;
             e.streamDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -943,23 +1027,28 @@ void MediaStreamEngine::StatsThreadMain() {
         }
         emitter_->Emit(std::move(e));
 
-        // 等待音频 ASC 超时兜底：muxer 尚未启动（无声源或音频迟迟未产出）时按时启动，避免录制悬空
+        // muxer 启动兜底重试：avcC 就绪后即可启动（音频轨恒建，ASC 有定值兜底），此处仅防漏
         if (pendingRecord_ && !mp4Started_) {
             std::lock_guard<std::mutex> lk(mutex_);
-            if (asc_.empty() && NowSteadyMs() - recordRequestSteadyMs_ >= kAscWaitTimeoutMs) {
-                MS_LOG_WARN("stats: ASC wait timeout, force video-only muxer start");
-            }
             StartMuxerLocked();
         }
 
-        // 麦克风降级检测（仅 micInner 模式）
-        if (config_.audioMode == "micInner" && !micDegraded_.load() && audioEncoder_ &&
-            !mixer_->MicEverReceived()) {
-            // Mic 持续无数据，降级为 inner
-            std::lock_guard<std::mutex> lk(mutex_);
-            if (!micDegraded_.load()) {
-                micDegraded_ = true;
-                EmitMicDegraded();
+        // 麦克风降级检测（仅 micInner 模式）。
+        // 时间基准必须是「采集真正开始」（STARTED 回调，即用户授权通过之后）：管线创建到用户点
+        // 「允许」之间实测有 12~14s 空窗，若从管线创建就开始计时，本判定会在用户还没授权时
+        // 就连续 tick 几十次、必然误报「麦克风无数据」（真机复现）。captureActiveNs_ < 0
+        // 表示尚未 STARTED，此时不判定（宁可漏报也不误报）。
+        if (config_.audioMode == "micInner" && !micDegraded_.load() && audioEncoder_ && mixer_) {
+            int64_t activeNs = captureActiveNs_.load(std::memory_order_relaxed);
+            bool elapsed = activeNs > 0 &&
+                           (NowNs() - activeNs) / 1000000 >= kMicDegradeThresholdMs;
+            if (elapsed && !mixer_->MicEverReceived()) {
+                // 采集起跑后持续 kMicDegradeThresholdMs 仍无麦克风数据 → 降级为仅内录
+                std::lock_guard<std::mutex> lk(mutex_);
+                if (!micDegraded_.load()) {
+                    micDegraded_ = true;
+                    EmitMicDegraded();
+                }
             }
         }
     }
