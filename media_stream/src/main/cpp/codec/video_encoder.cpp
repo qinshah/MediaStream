@@ -247,6 +247,19 @@ void VideoEncoder::OnNeedOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBu
     if (self == nullptr || avBuffer == nullptr) {
         return;
     }
+
+    // —— 锁序安全（修复“停止录屏后卡死闪退”死锁）——
+    // 本回调运行在编码器输出线程。旧实现把 callbacks_.onOutput（→引擎 OnEncodedVideo，会取引擎
+    // mutex_）也放在 self->mutex_(编码器锁) 内。与此同时采集线程在持有引擎 mutex_ 时又调
+    // InputFrame 来取本编码器 mutex_：两条路径互相等待对方手里的锁 → 环形等待死锁 → 所有引擎
+    // 线程被拖住，主线程停止录屏时卡在 StopRecording → 被 THREAD_BLOCK_3S 看门狗判冻结并杀进程。
+    // 这与参考 OBS 的适配约束一致：绝不在持有本侧锁时回调上层/下层（避免锁序反转）。
+    // 修复：在锁内仅拷贝出最终样本并释放输出缓冲，把真正分发到引擎(onOutput→OnEncodedVideo)
+    // 移到锁外执行，切断 engine↔encoder 的锁序反转。
+    std::vector<uint8_t> out;
+    int64_t ptsUs = 0;
+    bool isKey = false;
+    bool dispatch = false;
     {
         std::lock_guard<std::mutex> lock(self->mutex_);
         if (self->encoder_ == nullptr || !self->running_) {
@@ -277,25 +290,31 @@ void VideoEncoder::OnNeedOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBu
             return;
         }
 
-        bool isKeyframe = (attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0;
+        isKey = (attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0;
+        ptsUs = attr.pts;
 
         // Annex-B → AVCC（编码器输出为 Annex-B 时转换；已是 AVCC 则透传）
-        const uint8_t *outData = data;
-        int32_t outSize = size;
+        const uint8_t *finalData = data;
+        int32_t finalSize = size;
         if (size >= 4 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (data[2] == 0 && data[3] == 1))) {
             if (!self->avccEmitted_) {
                 self->ExtractAvcc(data, size);
             }
             if (self->ConvertAnnexBToAvcc(data, size, self->convertScratch_)) {
-                outData = self->convertScratch_.data();
-                outSize = static_cast<int32_t>(self->convertScratch_.size());
+                finalData = self->convertScratch_.data();
+                finalSize = static_cast<int32_t>(self->convertScratch_.size());
             }
         }
 
-        if (self->callbacks_.onOutput) {
-            self->callbacks_.onOutput(outData, outSize, attr.pts, isKeyframe);
-        }
+        // 锁内先拷贝最终样本（样本通常很小；拷贝后可释放输出缓冲并放开编码器锁，
+        // 避免跨锁引用 convertScratch_/OH_AVBuffer 的悬垂），随后在锁外安全分发到引擎。
+        out.assign(finalData, finalData + finalSize);
         OH_VideoEncoder_FreeOutputBuffer(codec, index);
+        dispatch = true;
+    }
+    // 锁外分发到引擎（OnEncodedVideo 取引擎 mutex_ 不再与本编码器 mutex_ 相交，死锁解除）
+    if (dispatch && self->callbacks_.onOutput) {
+        self->callbacks_.onOutput(out.data(), static_cast<int32_t>(out.size()), ptsUs, isKey);
     }
 }
 

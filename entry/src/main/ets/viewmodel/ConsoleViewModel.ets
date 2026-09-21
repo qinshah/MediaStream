@@ -197,12 +197,21 @@ export class ConsoleViewModel {
     const needsMic = this.audioMode === 'mic' || this.audioMode === 'micInner';
     if (needsMic && this.context) {
       if (!PermissionService.getInstance().hasMicPermission(this.context)) {
-        // 未授权：先弹出"仅内录继续/取消"确认弹窗
+        // 未授权：先自动发起麦克风权限申请（系统弹窗），授予后继续；拒绝再降级为"仅内录继续/取消"
         this.pendingAction = action;
-        this.pendingMicDegradeConfirm = true;
-        if (this.dialogDegradeHandler) {
-          this.dialogDegradeHandler();
-        }
+        PermissionService.getInstance().requestMicPermission(this.context).then(granted => {
+          if (!granted) {
+            // 用户拒绝授权 + 未勾选"不再询问"：弹出仅内录继续/取消
+            this.pendingMicDegradeConfirm = true;
+            if (this.dialogDegradeHandler) {
+              this.dialogDegradeHandler();
+            }
+          } else {
+            // 授权成功，直接开始
+            this.pendingMicDegradeConfirm = false;
+            this.applyAction(action);
+          }
+        });
         return;
       }
     }
@@ -236,15 +245,15 @@ export class ConsoleViewModel {
     }
     // 长时任务 → 引擎指令
     await BackgroundTaskService.getInstance().start(ctx);
+    const s = new StreamSettings();
+    s.rtmpUrl = this.rtmpUrl;
+    s.preset = this.preset;
+    s.fps = this.fps;
+    s.videoBitrateKbps = this.videoBitrateKbps;
+    s.audioMode = this.audioMode;
     if (action === 'record') {
-      this.service.startRecording();
+      this.service.startRecording(s);
     } else {
-      const s = new StreamSettings();
-      s.rtmpUrl = this.rtmpUrl;
-      s.preset = this.preset;
-      s.fps = this.fps;
-      s.videoBitrateKbps = this.videoBitrateKbps;
-      s.audioMode = this.audioMode;
       this.service.startStreaming(s);
     }
   }

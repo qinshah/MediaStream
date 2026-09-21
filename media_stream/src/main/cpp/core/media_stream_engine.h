@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -63,7 +64,8 @@ public:
     // 全部幂等防重入；失败返回 false 并填充 errCode/errMsg
     bool StartStreaming(const Config &config, int &errCode, std::string &errMsg);
     void StopStreaming();
-    bool StartRecording(int &errCode, std::string &errMsg);
+    // 录制使用传入的配置（含 audioMode 等），避免录制时沿用陈旧/默认配置导致麦克风等音频源未启用
+    bool StartRecording(const Config &config, int &errCode, std::string &errMsg);
     void StopRecording();
     void Destroy();
 
@@ -92,6 +94,7 @@ private:
     void OnRecordFinished(const Mp4Recorder::Result &result);
     void EmitRecordFinishedEvent(const Mp4Recorder::Result &result);
     void TryStartPendingRecordLocked(); // 编码配置齐全后启动挂起的录制
+    void StartMuxerLocked();            // 音视频编码配置齐备（或音频等待超时）后真正启动 muxer
 
     // 事件上报
     void EmitCaptureState(const char *state);
@@ -138,6 +141,19 @@ private:
     bool mp4Started_ = false;
     bool pendingRecord_ = false; // 编码配置未齐时挂起录制请求
 
+    // 无声音根因：MP4 muxer 需在 AddTrack 前确定音频 ASC，而 ASC 要待真实音频采集后才由编码器产出，
+    // 通常晚于视频 avcC。若在 avcC 就绪时立即建 muxer，会因 asc 尚空而丢失音频轨（录制静音）。
+    // 因此启动 muxer 前先缓存已编码视频样本到 pendingVideo_，等待 asc（或等待超时降级为仅视频轨）。
+    struct PendingVideoSample {
+        std::vector<uint8_t> data;
+        int64_t ptsUs = 0;
+        bool isKeyframe = false;
+    };
+    std::deque<PendingVideoSample> pendingVideo_;
+    int64_t recordRequestSteadyMs_ = 0;  // 录制请求发起时刻（墙钟，用于 ASC 等待超时）
+    static constexpr int64_t kAscWaitTimeoutMs = 1000;
+    static constexpr size_t kPendingVideoCap = 120; // 等待期视频缓存上限（~4s@30fps）
+
     // RGBA 兜底转换暂存
     std::vector<uint8_t> rgbaToNv12Scratch_;
 
@@ -161,6 +177,7 @@ private:
     // 帧率节流 + 输出 PTS 基线：PTS 按「输出时刻 - 首帧输出时刻」的墙钟差生成（μs），
     // 保证 MP4 时长/播放速度正确（编码器透传 pts 恒为 0；按帧号×间隔会因实际帧率≠fps 而失真）
     std::atomic<int64_t> captureLastNs_{0};
+    std::atomic<int> dumpFrames_{0}; // [DBG] 采集原始 RGBA 抽样帧计数（限前3帧）
     std::atomic<int64_t> outPtsStartNs_{ -1 };
 
     // 麦克风降级检测

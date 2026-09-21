@@ -32,6 +32,8 @@ bool AudioEncoder::Start(Callbacks callbacks) {
     pcmQueue_.clear();
     ascEmitted_ = false;
     asc_.clear();
+    idleIndex_ = -1;
+    idleMem_ = nullptr;
 
     encoder_ = OH_AudioEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_AUDIO_AAC);
     if (encoder_ == nullptr) {
@@ -88,19 +90,56 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
     if (pcm == nullptr || bytes <= 0) {
         return;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_) {
-        return;
+    // 若此前 onNeedInputData 已将某个输入槽 hold 住，这里优先把新增 PCM 填入该槽并 Push，
+    // 使编码器及时拿到真实音频（OBS 式解耦喂音）。
+    int32_t pushIdx = -1;
+    int32_t pushPtsUs = 0;
+    int32_t pushSize = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_) {
+            return;
+        }
+        if (pcmQueue_.empty()) {
+            pcmPtsNs_ = ptsNs;
+        }
+        size_t samples = static_cast<size_t>(bytes) / 2;
+        pcmQueue_.insert(pcmQueue_.end(), pcm, pcm + samples);
+        // 防积压：丢弃最旧数据（音频不阻塞采集）
+        while (pcmQueue_.size() > kMaxQueueSamples) {
+            pcmQueue_.pop_front();
+            pcmPtsNs_ += 1000000000LL / (kSampleRate * kChannels); // 每采样点时间
+        }
+        // 用暂留槽直接推送一包，降低等待编码器再次回调的延迟
+        if (idleIndex_ >= 0 && idleMem_ != nullptr) {
+            uint8_t *addr = OH_AVMemory_GetAddr(idleMem_);
+            int32_t capacity = OH_AVMemory_GetSize(idleMem_);
+            size_t maxSamples = static_cast<size_t>(capacity) / 2;
+            size_t n = pcmQueue_.size() < maxSamples ? pcmQueue_.size() : maxSamples;
+            n &= ~static_cast<size_t>(1);
+            if (addr != nullptr && capacity > 0 && n > 0) {
+                for (size_t i = 0; i < n; i++) {
+                    reinterpret_cast<int16_t *>(addr)[i] = pcmQueue_[i];
+                }
+                for (size_t i = 0; i < n; i++) {
+                    pcmQueue_.pop_front();
+                }
+                pushPtsUs = static_cast<int32_t>(pcmPtsNs_ / 1000);
+                pcmPtsNs_ += static_cast<int64_t>(n) * 1000000000LL / (kSampleRate * kChannels);
+                pushSize = static_cast<int32_t>(n * 2);
+                pushIdx = idleIndex_;
+                idleIndex_ = -1;
+                idleMem_ = nullptr;
+            }
+        }
     }
-    if (pcmQueue_.empty()) {
-        pcmPtsNs_ = ptsNs;
-    }
-    size_t samples = static_cast<size_t>(bytes) / 2;
-    pcmQueue_.insert(pcmQueue_.end(), pcm, pcm + samples);
-    // 防积压：丢弃最旧数据（音频不阻塞采集）
-    while (pcmQueue_.size() > kMaxQueueSamples) {
-        pcmQueue_.pop_front();
-        pcmPtsNs_ += 1000000000LL / (kSampleRate * kChannels); // 每采样点时间
+    if (pushIdx >= 0) {
+        OH_AVCodecBufferAttr attr{};
+        attr.pts = pushPtsUs;
+        attr.size = pushSize;
+        attr.offset = 0;
+        attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+        OH_AudioEncoder_PushInputData(encoder_, static_cast<uint32_t>(pushIdx), attr);
     }
 }
 
@@ -113,6 +152,8 @@ void AudioEncoder::Stop() {
         enc = encoder_;
         encoder_ = nullptr;
         running_ = false;
+        idleIndex_ = -1;
+        idleMem_ = nullptr; // 已 hold 的输入槽随编解器销毁失效，置空避免悬垂
     }
     if (enc != nullptr) {
         OH_AudioEncoder_Stop(enc);
@@ -164,8 +205,13 @@ void AudioEncoder::OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
     }
 
     OH_AVCodecBufferAttr attr = {};
+    int32_t pushIdx = -1;
     {
         std::lock_guard<std::mutex> lock(self->mutex_);
+        // 已有暂留的输入槽（此前无数据时 hold 住），不重复占槽；待 InputPcm 有数据后填回。
+        if (self->idleIndex_ >= 0) {
+            return;
+        }
         if (self->running_ && !self->pcmQueue_.empty()) {
             // 填充尽可能多的 PCM（偶数采样对齐，保证声道对完整）
             size_t availSamples = self->pcmQueue_.size();
@@ -185,17 +231,20 @@ void AudioEncoder::OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
                 attr.size = static_cast<int32_t>(samples * 2);
                 attr.offset = 0;
                 attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-                OH_AudioEncoder_PushInputData(codec, index, attr);
-                return;
+                pushIdx = static_cast<int32_t>(index);
             }
         }
+        if (pushIdx < 0) {
+            // 暂无音频：把当前输入槽 hold 住（不 Push），避免：
+            //  1) 0 长缓冲 → PcmFillFrame 输入 0 采样刷屏 → APP_FREEZE；
+            //  2) 静音垫底 → onNeedInputData 紧张循环 → Stop 长时间阻塞（主线程 THREAD_BLOCK_3S）。
+            // 待 InputPcm 有真实 PCM 后再用此槽 Push，实现 OBS 式喂音解耦。
+            self->idleIndex_ = static_cast<int32_t>(index);
+            self->idleMem_ = data;
+            return;
+        }
     }
-    // 无数据：送入 0 长度跳过该缓冲（避免编码器等待）
-    attr.pts = 0;
-    attr.size = 0;
-    attr.offset = 0;
-    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-    OH_AudioEncoder_PushInputData(codec, index, attr);
+    OH_AudioEncoder_PushInputData(codec, static_cast<uint32_t>(pushIdx), attr);
 }
 
 void AudioEncoder::OnNewOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data,

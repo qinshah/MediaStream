@@ -59,6 +59,13 @@ private:
     // PCM 输入队列（采样点为单位，s16）
     std::deque<int16_t> pcmQueue_;
     int64_t pcmPtsNs_ = 0;
+
+    // OBS 式解耦：onNeedInputData 在无数据时不紧张循环（避免编码器 Stop 阻塞）。
+    // 无数据时暂留一个输入槽（idleIndex_/idleMem_，不 Push），等 InputPcm 有真实音频后再填回，
+    // 从而把音频喂入与编码器“要输入”回调解耦，杜绝静音垫底导致的 CPU/Stop 长时间阻塞。
+    int32_t idleIndex_ = -1;
+    OH_AVMemory *idleMem_ = nullptr;
+
     bool ascEmitted_ = false;
     std::vector<uint8_t> asc_;
 };

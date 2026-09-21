@@ -132,12 +132,30 @@ napi_value NapiStopStreaming(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// startRecording: () => void
+// startRecording: (config?: OutputConfig) => void
+// 录制需携带会话配置（尤其 audioMode）；缺省时回退为与默认一致的 "inner"
 napi_value NapiStartRecording(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    MediaStreamEngine::Config cfg;
+    if (argc >= 1 && args[0] != nullptr) {
+        cfg.rtmpUrl = GetStringProp(env, args[0], "rtmpUrl");
+        cfg.preset = GetStringProp(env, args[0], "preset");
+        if (cfg.preset.empty()) {
+            cfg.preset = "720p";
+        }
+        cfg.fps = static_cast<int>(GetNumProp(env, args[0], "fps", 30));
+        cfg.videoBitrateKbps = static_cast<int>(GetNumProp(env, args[0], "videoBitrateKbps", 4000));
+        cfg.audioMode = GetStringProp(env, args[0], "audioMode");
+        if (cfg.audioMode.empty()) {
+            cfg.audioMode = "inner";
+        }
+    }
     int errCode = 0;
     std::string errMsg;
     EnsureEmitter();
-    if (!Engine().StartRecording(errCode, errMsg)) {
+    if (!Engine().StartRecording(cfg, errCode, errMsg)) {
         ThrowNapiError(env, errCode, errMsg.c_str());
     }
     return nullptr;

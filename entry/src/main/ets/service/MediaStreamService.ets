@@ -162,12 +162,23 @@ export class MediaStreamService {
     }
   }
 
-  startRecording(): void {
+  startRecording(settings?: StreamSettings): void {
     this.recordStatus_ = RecordStatus.RECORDING;
     this.recordError_ = '';
     this.notifyRecord();
     try {
-      native.startRecording();
+      // 录制必须携带会话配置（尤其 audioMode），否则原生侧沿用陈旧/默认配置导致麦克风等音频源未启用
+      if (settings) {
+        native.startRecording({
+          rtmpUrl: settings.rtmpUrl,
+          preset: settings.preset as ResolutionPreset,
+          fps: settings.fps,
+          videoBitrateKbps: settings.videoBitrateKbps,
+          audioMode: settings.audioMode as AudioSourceMode,
+        });
+      } else {
+        native.startRecording();
+      }
     } catch (err) {
       this.recordStatus_ = RecordStatus.ERROR;
       this.recordError_ = `启动录制失败: ${JSON.stringify(err)}`;

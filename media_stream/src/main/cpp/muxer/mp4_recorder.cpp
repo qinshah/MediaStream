@@ -42,6 +42,7 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     stopRequested_ = false;
     storageError_ = false;
     finished_ = false;
+    writeThreadDone_ = false;
     firstPtsUs_ = -1;
     lastPtsUs_ = 0;
     writtenBytes_ = 0;
@@ -163,6 +164,11 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     return true;
 }
 
+// 写队列满时的等待上限：超时即丢弃该元素（返回 false），避免持锁入队时因写线程
+// 短暂卡顿（如 OH_AVMuxer 瞬时阻塞）而无限阻塞持锁线程，造成整个录制管线死锁
+// （编码输出线程持 engine mutex_ → StopRecording/采集线程全部卡死 → APP_INPUT_BLOCK）。
+static constexpr int64_t kWritePushTimeoutMs = 150; // 150ms 内没腾出空间则丢当前编码帧
+
 void Mp4Recorder::WriteVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe) {
     if (!recording_.load() || stopRequested_.load() || data == nullptr || size <= 0) {
         return;
@@ -172,8 +178,8 @@ void Mp4Recorder::WriteVideo(const uint8_t *data, int32_t size, int64_t ptsUs, b
     s.ptsUs = ptsUs;
     s.flags = isKeyframe ? AVCODEC_BUFFER_FLAGS_SYNC_FRAME : AVCODEC_BUFFER_FLAGS_NONE;
     s.isVideo = true;
-    if (queue_ && !queue_->Push(std::move(s))) {
-        MS_LOG_WARN("mp4 write queue closed, drop video sample");
+    if (queue_ && !queue_->TryPush(std::move(s), kWritePushTimeoutMs)) {
+        MS_LOG_WARN("mp4 write queue full, drop video sample (size=%{public}d)", size);
     }
 }
 
@@ -189,8 +195,8 @@ void Mp4Recorder::WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
     s.ptsUs = ptsUs;
     s.flags = AVCODEC_BUFFER_FLAGS_NONE;
     s.isVideo = false;
-    if (queue_ && !queue_->Push(std::move(s))) {
-        MS_LOG_WARN("mp4 write queue closed, drop audio sample");
+    if (queue_ && !queue_->TryPush(std::move(s), kWritePushTimeoutMs)) {
+        MS_LOG_WARN("mp4 write queue full, drop audio sample (size=%{public}d)", size);
     }
 }
 
@@ -207,17 +213,32 @@ int64_t Mp4Recorder::DurationMs() const {
 }
 
 void Mp4Recorder::Stop() {
-    if (!recording_.exchange(false)) {
-        return;
+    if (!recording_.exchange(false) && stopRequested_.load()) {
+        return; // 已停止过（幂等）
     }
     stopRequested_ = true;
     if (queue_) {
         queue_->Close(); // 唤醒写线程，排空后退出
     }
+    // 核心修复：绝不在此同步 join 写线程。写线程可能阻塞在 OH_AVMuxer_WriteSampleBuffer / 
+    // OH_AVMuxer_Stop 内部挂死，同步 join 会把调用线程（主/JS 线程）一起拖死，
+    // 被系统 THREAD_BLOCK 看门狗判冻结并杀进程（正是“停止录屏后卡死闪退”的根因）。
+    // 改为 detach：写线程在后台自行完成后序 muxer 收尾（写 moov→Destroy→close→onFinished）。
+    // 调用方在销毁本对象前需 WaitWriteThreadDone() 确认写线程已退出，避免悬垂 this(UAF)。
     if (writeThread_.joinable()) {
-        writeThread_.join();
+        writeThread_.detach();
     }
-    recording_ = false;
+}
+
+bool Mp4Recorder::WaitWriteThreadDone(int64_t timeoutMs) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!writeThreadDone_.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return writeThreadDone_.load();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
 }
 
 bool Mp4Recorder::WriteOneSample(const Sample &sample) {
@@ -261,7 +282,16 @@ bool Mp4Recorder::WriteOneSample(const Sample &sample) {
     }
 
     int32_t track = sample.isVideo ? videoTrack_ : audioTrack_;
+    // 临时诊断：确认 OH_AVMuxer_WriteSampleBuffer 挂点（前/后各印一次）
+    int64_t muxCnt = writtenSamples_.load();
+    bool logThis = (muxCnt < 5 || muxCnt % 500 == 0) && muxCnt != 0;
+    if (logThis) {
+        MS_LOG_WARN("[MUX] WSB#%{public}lld before sz=%{public}lld track=%{public}d", muxCnt, sample.data.size(), track);
+    }
     int32_t rc = OH_AVMuxer_WriteSampleBuffer(muxer_, track, buffer);
+    if (logThis) {
+        MS_LOG_WARN("[MUX] WSB#%{public}lld after  rc=%{public}d", muxCnt, rc);
+    }
     OH_AVBuffer_Destroy(buffer);
     if (rc != AV_ERR_OK) {
         // 常见为存储不足
@@ -290,13 +320,17 @@ void Mp4Recorder::WriteThreadMain() {
 
     // 安全收尾：Stop 写 moov → Destroy → close(fd)
     if (muxer_ != nullptr) {
+        MS_LOG_WARN("[MUX] OH_AVMuxer_Stop before (moov)");
         int32_t s = OH_AVMuxer_Stop(muxer_);
+        MS_LOG_WARN("[MUX] OH_AVMuxer_Stop after  rc=%{public}d", s);
         if (s != AV_ERR_OK) {
             MS_LOG_ERROR("OH_AVMuxer_Stop failed rc=%{public}d (moov 未写出，文件将不可播放)", s);
         } else {
             MS_LOG_INFO("OH_AVMuxer_Stop ok, moov written");
         }
+        MS_LOG_WARN("[MUX] OH_AVMuxer_Destroy before");
         OH_AVMuxer_Destroy(muxer_);
+        MS_LOG_WARN("[MUX] OH_AVMuxer_Destroy after");
         muxer_ = nullptr;
     }
     if (fd_ >= 0) {
@@ -304,7 +338,9 @@ void Mp4Recorder::WriteThreadMain() {
         fd_ = -1;
     }
 
+    // 首次结束时才触发 onFinished；此后为兜底守卫（正常每周期仅一个写线程，防重复回调）
     if (finished_.exchange(true)) {
+        writeThreadDone_ = true; // 即使提前返回也要标记写线程结束，防止调用方无限等待
         return;
     }
     Result result;
@@ -328,6 +364,8 @@ void Mp4Recorder::WriteThreadMain() {
     if (callbacks_.onFinished) {
         callbacks_.onFinished(result);
     }
+    // 最后设置：确保 onFinished（访问本对象成员）已执行完，调用方才可安全销毁本对象(UAF 防线)
+    writeThreadDone_ = true;
 }
 
 } // namespace media_stream

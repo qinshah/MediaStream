@@ -51,8 +51,15 @@ public:
     void WriteVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe);
     void WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs);
 
-    // 停止并安全收尾（幂等；回调 onFinished 在写线程退出前触发）
+    // 停止：（幂等）仅打停止标记并唤醒写线程，绝不在此同步 join 写线程。
+    // 写线程可能在 OH_AVMuxer_* 内部挂死，同步 join 会把调用线程（主/JS）一起拖死，
+    // 被看门狗 THREAD_BLOCK 判冻结杀进程。因此改为 detach，让写线程在后台自行
+    // 完成 muxer 收尾（写 moov→Destroy→close→onFinished）。调用方需通过
+    // WaitWriteThreadDone() 在销毁本对象前确认写线程已退出，避免悬垂 this(UAF)。
     void Stop();
+
+    // 有界等待写线程结束；返回 true 表示已退出。timeoutMs 上限，避免调用方无限阻塞。
+    bool WaitWriteThreadDone(int64_t timeoutMs);
 
     bool IsRecording() const { return recording_.load(); }
     int64_t DurationMs() const;
@@ -91,6 +98,9 @@ private:
     std::atomic<int64_t> writtenBytes_{0};
     std::atomic<int64_t> writtenSamples_{0};
     std::atomic<bool> finished_{false};
+    // 写线程是否已完全退出（含 muxer 收尾）。Stop 改为 detach 后用此标志让调用方
+    // 在销毁本对象前做有界等待，避免悬垂 this(UAF)。
+    std::atomic<bool> writeThreadDone_{false};
 
     int width_ = 0;
     int height_ = 0;

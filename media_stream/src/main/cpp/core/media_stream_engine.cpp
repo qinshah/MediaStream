@@ -24,6 +24,13 @@ static int64_t NowNs() {
         .count();
 }
 
+// 单调时钟：ms（供 ASC 等待超时判定）
+static int64_t NowSteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 MediaStreamEngine &MediaStreamEngine::Instance() {
     static MediaStreamEngine engine;
     return engine;
@@ -289,7 +296,7 @@ void MediaStreamEngine::StopStreaming() {
     MaybeStopPipelineUnlocked();
 }
 
-bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
+bool MediaStreamEngine::StartRecording(const Config &config, int &errCode, std::string &errMsg) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!inited_) {
         errCode = static_cast<int>(EngineError::kInternalError);
@@ -301,6 +308,11 @@ bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
         errMsg = "录制已在进行中";
         return false;
     }
+    // 录制使用调用方传入的会话配置（含 audioMode/preset/fps/bitrate），确保麦克风等音频源真正启用。
+    // 此前在此沿用 config_（仅 StartStreaming 会更新），纯录制场景下恒为默认 "inner"，导致
+    // 选"麦克风"录制时 mic=0、无声。
+    config_ = config;
+    lastConfig_ = config;
     // 若无推流，需独立拉起管线（录制是首个输出）
     if (!EnsureCapturePipelineLocked(errCode, errMsg)) {
         return false;
@@ -311,40 +323,13 @@ bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
     MS_LOG_WARN("[CFG] startRecording fps=%{public}d bitrate=%{public}d mode=%{public}s", config_.fps,
                 config_.videoBitrateKbps, config_.audioMode.c_str());
 
-    // 编码配置齐备才真正启动 MP4；否则先标记 pendingRecord
-    // 仅视频轨即可启动（系统内录音频无播放时无 ASC，录制静音画面也需能落盘）
-    if (!avcC_.empty() && !mp4Started_) {
-        mp4Recorder_ = std::make_unique<Mp4Recorder>();
-        Mp4Recorder::Callbacks mcb;
-        mcb.onFinished = [this](const Mp4Recorder::Result &result) {
-            // 仅在该锁内更新状态并派发事件，随后释放锁；管线（OH_*_Stop）收尾放到锁外执行，
-            // 避免在写线程（正在被主线程 join）上持锁调用阻断式 Stop 造成锁序反转死锁。
-            {
-                std::lock_guard<std::mutex> lk(mutex_);
-                recordState_ = "stopped";
-                EmitRecordState("stopped");
-                EmitRecordFinishedEvent(result);
-            }
-            MaybeStopPipelineUnlocked();
-        };
-        mcb.onError = [this](int code, const std::string &message) {
-            std::lock_guard<std::mutex> lk(mutex_);
-            recordState_ = "error";
-            EmitRecordState("error");
-            EmitError(static_cast<EngineError>(code), message, "mp4");
-        };
-        int w = videoEncoder_ ? videoEncoder_->Width() : 720;
-        int h = videoEncoder_ ? videoEncoder_->Height() : 1280;
-        if (!mp4Recorder_->Start(videosDir_, w, h, avcC_, asc_, std::move(mcb))) {
-            mp4Recorder_.reset();
-            errCode = static_cast<int>(EngineError::kInternalError);
-            errMsg = "启动录制失败";
-            return false;
-        }
-        mp4Started_ = true;
-    } else {
-        pendingRecord_ = true;
-    }
+    // 挂起录制并启动 muxer：muxer 需在 AddTrack 前拿到音频 ASC（通常晚于视频 avcC），
+    // 因此在 asc 就绪（或等待超时降级仅视频轨）前先把视频帧缓存，避免漏掉音频轨导致录制静音。
+    pendingRecord_ = true;
+    recordRequestSteadyMs_ = NowSteadyMs();
+    pendingVideo_.clear();
+    mp4Started_ = false;
+    StartMuxerLocked();
 
     recordState_ = "recording";
     EmitRecordState("recording");
@@ -358,14 +343,19 @@ bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
 }
 
 void MediaStreamEngine::StopRecording() {
-    // 勿在持有 mutex_ 时调用 mp4Recorder_->Stop()：Stop 内部会 join 写线程，
-    // 而写线程收尾会回调 onFinished 并重新 lock(mutex_)。若持锁 join 必然死锁，
-    // 导致主/JS 线程无限阻塞，被系统 THREAD_BLOCK_6S 判冻结并杀进程。
-    // 因此这里先短暂上锁更新状态并取出指针，再释放锁后 join。
+    // 勿在持有 mutex_ 时调用 mp4Recorder_->Stop()：其内部会置停止标记并 detach 写线程，
+    // 写线程收尾会回调 onFinished 并重新 lock(mutex_)。因此先短暂上锁更新状态并取出指针，
+    // 释放锁后再调非阻塞 Stop()（不做同步 join，绝不拖死调用线程）。
     Mp4Recorder *recorder = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pendingRecord_ = false;
+        recordRequestSteadyMs_ = 0;
+        pendingVideo_.clear(); // muxer 未启动即停止：丢弃缓存的待写视频帧
+        // 立即反映停止意图：即使写线程在 OH_AVMuxer 内挂死、onFinished 迟迟不来，
+        // 也能让 UI 立刻回到 stopped，避免卡在“录制中”状态（配合 Stop() 非阻塞 detach）。
+        recordState_ = "stopped";
+        EmitRecordState("stopped");
         recorder = mp4Recorder_.get();
     }
     if (recorder != nullptr) {
@@ -389,9 +379,12 @@ void MediaStreamEngine::Destroy() {
         }
         recorder = mp4Recorder_.get();
     }
-    // 同样在锁外 join 写线程，避免 onFinished 重新加锁造成死锁
+    // 同样在锁外 join 写线程，避免 onFinished 重新加锁造成死锁。
+    // Stop() 已改为非阻塞(detach)：此处用超时等待写线程真正退出后再 reset，避免销毁
+    // 仍被 OH_AVMuxer 挂住的写线程上的 this 造成悬垂(UAF)。
     if (recorder != nullptr) {
         recorder->Stop();
+        recorder->WaitWriteThreadDone(3000); // 有界等待：不因 muxer 挂死而无限阻塞
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -535,6 +528,8 @@ void MediaStreamEngine::TeardownPipelineUnlocked() {
         avcC_.clear();
         asc_.clear();
         mp4Started_ = false;
+        pendingVideo_.clear();
+        recordRequestSteadyMs_ = 0;
     }
     if (cap) {
         cap->Stop();
@@ -560,15 +555,22 @@ void MediaStreamEngine::MaybeStopPipelineUnlocked() {
     if (!teardown) {
         return;
     }
-    TeardownPipelineUnlocked();
-    {
+    // 关键修复：管线收尾（OH_AVScreenCapture_Stop / OH_*_Stop / Destroy）改为在独立后台线程执行，
+    // 而非在执行本函数的线程上同步执行。原因是停止录制时主线程会在 mp4Recorder_->Stop() 里
+    // writeThread_.join() 等待写线程退出；而写线程收尾回调 onFinished 又会走到这里做整条管线
+    // 的 OH_*_Stop。若这些 Stop 任一个耗时/阻塞，主线程会一直卡在 join → APP THREAD_BLOCK_3S 被
+    // 判冻结并杀进程。把整段 OH_*_Stop 挪到 detached 线程后，主线程立即返回、永不被编码器 Stop 阻塞。
+    // TeardownPipelineUnlocked 锁内 std::move 剥离对象、锁外执行 Stop，天然线程安全且幂等。
+    std::thread teardownThread([this]() {
+        TeardownPipelineUnlocked();
         std::lock_guard<std::mutex> lock(mutex_);
         if (captureState_ != "idle") {
             captureState_ = "idle";
             EmitCaptureState("idle");
         }
         StopStatsLocked();
-    }
+    });
+    teardownThread.detach();
 }
 
 // —— 采集回调 ——
@@ -631,19 +633,47 @@ void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int heig
         nv12 = scaleNv12Scratch_.data();
     }
 
-    // [DBG] 进编码器前的最终缓冲均值/中心采样（判断是否黑帧）
+    // [DBG] 进编码器前的最终缓冲均值/中心采样（判断是否黑/绿帧）。
+    // 新增色度抽样：绿色=亮Y(正确)+错UV。此处打印原始RGBA中心、缩放后NV12中心Y与UV，
+    // 一次定位绿色是采集就错(RGBA)还是转换/编码(RGB→UV)错。
     {
         long sum = 0; int n = ew * eh; const uint8_t *p = nv12;
         for (int i = 0; i < n; i += ew) sum += p[i];
         int r0 = p[0], rMid = p[(eh / 2) * ew + (ew / 2)];
-        MS_LOG_WARN("[DBG] encY meancol=%{public}ld mid=%{public}d top=%{public}d isNv12=%{public}d", sum / (ew ? eh : 1),
-                    rMid, r0, isNv12 ? 1 : 0);
+        // 缩放到编码尺寸后 NV12 的中心 UV（UV 平面在 Y 之后，交错 U,V）
+        uint8_t cu = 0, cv = 0;
+        if (ew > 1 && eh > 1) {
+            const uint8_t *uvp = p + static_cast<size_t>(ew) * eh;
+            const int cy = (eh / 2), cx = (ew / 2);
+            cu = uvp[(cy / 2) * ew + (cx / 2) * 2];
+            cv = uvp[(cy / 2) * ew + (cx / 2) * 2 + 1];
+        }
+        MS_LOG_WARN("[DBG] encY meancol=%{public}ld midY=%{public}d topY=%{public}d midU=%{public}d midV=%{public}d isNv12=%{public}d",
+                    sum / (ew ? eh : 1), rMid, r0, cu, cv, isNv12 ? 1 : 0);
+        // 采集原始 RGBA 抽样（非 NV12 采集时）：中心/左上角各4个通道，判断原始帧是否真内容
+        if (!isNv12 && dumpFrames_.load() < 3) {
+            auto px = [&](int x, int y) {
+                if (x >= width || y >= height) return;
+                const uint8_t *q = data + (static_cast<size_t>(y) * width + x) * 4;
+                MS_LOG_WARN("[DBG] rgba[%{public}d,%{public}d]=RGBA(%{public}u,%{public}u,%{public}u,%{public}u)",
+                            x, y, q[0], q[1], q[2], q[3]);
+            };
+            px(width / 2, height / 2);
+            px(0, 0);
+            px(width / 4, height / 4);
+            dumpFrames_.fetch_add(1);
+        }
     }
 
     videoEncoder_->InputFrame(nv12, ptsUs);
 }
 
 void MediaStreamEngine::OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
+    // [AUD] 内录音频到达监控（限 64 帧打一条，确认无声源时是否真无内录数据）
+    static std::atomic<int> innerCtr{0};
+    if ((innerCtr.fetch_add(1) & 0x3F) == 0) {
+        MS_LOG_INFO("[AUD] inner audio bytes=%{public}d total=%{public}d", bytes, innerCtr.load());
+    }
     if (audioEncoder_) {
         // 双输入由 mixer 混音，单输入直通
         if (mixer_ && config_.audioMode == "micInner") {
@@ -655,6 +685,11 @@ void MediaStreamEngine::OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, 
 }
 
 void MediaStreamEngine::OnCapturedMicAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
+    // [AUD] 麦克风音频到达监控（限 64 帧打一条，确认 mic 模式数据是否真正流入）
+    static std::atomic<int> micCtr{0};
+    if ((micCtr.fetch_add(1) & 0x3F) == 0) {
+        MS_LOG_INFO("[AUD] mic audio bytes=%{public}d total=%{public}d", bytes, micCtr.load());
+    }
     if (audioEncoder_) {
         if (mixer_ && config_.audioMode == "micInner") {
             mixer_->PushMic(pcm, bytes, ptsNs);
@@ -728,8 +763,21 @@ void MediaStreamEngine::OnEncodedVideo(const uint8_t *data, int32_t size, int64_
     if (rtmpClient_) {
         rtmpClient_->SendVideo(data, size, newPtsUs, isKeyframe);
     }
-    if (mp4Recorder_ && mp4Started_) {
-        mp4Recorder_->WriteVideo(data, size, newPtsUs, isKeyframe);
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (mp4Recorder_ && mp4Started_) {
+            mp4Recorder_->WriteVideo(data, size, newPtsUs, isKeyframe);
+        } else if (pendingRecord_ && !mp4Started_) {
+            // 等待音频 ASC（muxer 未启动）期间缓存视频帧，待 muxer 启动后统一灌入
+            PendingVideoSample s;
+            s.data.assign(data, data + size);
+            s.ptsUs = newPtsUs;
+            s.isKeyframe = isKeyframe;
+            pendingVideo_.push_back(std::move(s));
+            while (pendingVideo_.size() > kPendingVideoCap) {
+                pendingVideo_.pop_front();
+            }
+        }
     }
 }
 
@@ -761,9 +809,35 @@ void MediaStreamEngine::OnAscReady(const std::vector<uint8_t> &asc) {
 }
 
 void MediaStreamEngine::TryStartPendingRecordLocked() {
-    // 仅需视频 avcC 到位即可启动（音频可选，静音画面正常落盘）
+    StartMuxerLocked();
+}
+
+void MediaStreamEngine::StartMuxerLocked() {
+    // 真正启动 MP4 封装器的三个前置：
+    //  1) 已有录制请求 pendingRecord_；2) muxer 尚未启动；3) 视频 avcC 已就绪（视频轨必需）。
+    // 音频是可选轨：只要有 ASC 就加音频轨；无 ASC（如内录无播放、音频持续未产出）时在等待
+    // kAscWaitTimeoutMs 后降级为仅视频轨，避免静音录制永远无法开始。
     if (!pendingRecord_ || mp4Started_ || avcC_.empty()) {
         return;
+    }
+    if (asc_.empty()) {
+        int64_t waited = NowSteadyMs() - recordRequestSteadyMs_;
+        if (waited < kAscWaitTimeoutMs) {
+            return; // 音频 ASC 未到且未超时：继续缓存视频帧等待音频轨
+        }
+        MS_LOG_WARN("audio ASC not ready within %{public}lldms, record video-only", 
+                    static_cast<long long>(kAscWaitTimeoutMs));
+    } else {
+        MS_LOG_INFO("StartMuxer with audio ASC %{public}zu bytes", asc_.size());
+    }
+
+    // 复用/替换 Mp4Recorder 前，先确保上一个录制器的写线程已退出，避免 reset 销毁
+    // 仍在使用 this 的挂死写线程 (UAF)。stop 请求未发起时先 Stop() 让其 detach 后台收尾，
+    // 再超时等待其真正退出。
+    if (mp4Recorder_) {
+        Mp4Recorder *old = mp4Recorder_.get();
+        old->Stop();
+        old->WaitWriteThreadDone(3000);
     }
     mp4Recorder_ = std::make_unique<Mp4Recorder>();
     Mp4Recorder::Callbacks mcb;
@@ -785,13 +859,25 @@ void MediaStreamEngine::TryStartPendingRecordLocked() {
     };
     int w = videoEncoder_ ? videoEncoder_->Width() : 720;
     int h = videoEncoder_ ? videoEncoder_->Height() : 1280;
-    if (mp4Recorder_->Start(videosDir_, w, h, avcC_, asc_, std::move(mcb))) {
-        mp4Started_ = true;
-    } else {
+    if (!mp4Recorder_->Start(videosDir_, w, h, avcC_, asc_, std::move(mcb))) {
         mp4Recorder_.reset();
         pendingRecord_ = false;
         recordState_ = "error";
         EmitRecordState("error");
+        return;
+    }
+    mp4Started_ = true;
+    // muxer 已启动：把等待 ASC 期间缓存的视频帧灌入写队列（flush）
+    const size_t flushed = pendingVideo_.size();
+    while (!pendingVideo_.empty()) {
+        PendingVideoSample &s = pendingVideo_.front();
+        mp4Recorder_->WriteVideo(s.data.data(), static_cast<int32_t>(s.data.size()), s.ptsUs, s.isKeyframe);
+        pendingVideo_.pop_front();
+    }
+    if (flushed > 0) {
+        MS_LOG_INFO("muxer started, flushed %{public}zu buffered video samples", flushed);
+    } else {
+        MS_LOG_INFO("muxer started (no buffered samples)");
     }
 }
 
@@ -856,6 +942,15 @@ void MediaStreamEngine::StatsThreadMain() {
             e.recordDurationMs = mp4Recorder_->DurationMs();
         }
         emitter_->Emit(std::move(e));
+
+        // 等待音频 ASC 超时兜底：muxer 尚未启动（无声源或音频迟迟未产出）时按时启动，避免录制悬空
+        if (pendingRecord_ && !mp4Started_) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (asc_.empty() && NowSteadyMs() - recordRequestSteadyMs_ >= kAscWaitTimeoutMs) {
+                MS_LOG_WARN("stats: ASC wait timeout, force video-only muxer start");
+            }
+            StartMuxerLocked();
+        }
 
         // 麦克风降级检测（仅 micInner 模式）
         if (config_.audioMode == "micInner" && !micDegraded_.load() && audioEncoder_ &&

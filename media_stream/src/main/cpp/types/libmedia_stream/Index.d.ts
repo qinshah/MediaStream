@@ -80,7 +80,7 @@ export interface MediaStreamEvent {
 export const init: (filesDir: string) => void;
 export const startStreaming: (config: OutputConfig) => void;
 export const stopStreaming: () => void;
-export const startRecording: () => void;
+export const startRecording: (config?: OutputConfig) => void;
 export const stopRecording: () => void;
 export const onEvent: (callback: (event: MediaStreamEvent) => void) => void;
 export const destroy: () => void;

@@ -6,6 +6,7 @@
 //  - DropNewestVideo：RTMP 发送语义，队满时丢弃新入队元素（直播链路不背压采集/编码）
 
 #include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <deque>
 #include <mutex>
@@ -41,6 +42,30 @@ public:
                 droppedCount_++;
                 return false;
             }
+        }
+        queue_.push_back(std::move(item));
+        notEmpty_.notify_one();
+        return true;
+    }
+
+    // 带超时的入队（TimeBlockOnFull 语义）：最多等待 timeoutMs 毫秒获取空间，超时返回 false。
+    // 用于在「持锁调用入队」的场景下避免因消费者（写线程）短暂卡顿而无限阻塞持锁线程，
+    // 造成锁序反转死锁。返回 false 表示超时/关闭/未入队，调用方应丢弃该元素。
+    bool TryPush(T item, int64_t timeoutMs) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (closed_) {
+            return false;
+        }
+        if (queue_.size() >= capacity_) {
+            notFull_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                              [this] { return queue_.size() < capacity_ || closed_; });
+        }
+        if (closed_) {
+            return false;
+        }
+        if (queue_.size() >= capacity_) {
+            droppedCount_++;
+            return false; // 超时仍未腾出空间
         }
         queue_.push_back(std::move(item));
         notEmpty_.notify_one();
