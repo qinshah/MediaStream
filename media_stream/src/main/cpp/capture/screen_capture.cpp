@@ -221,7 +221,13 @@ void ScreenCapture::HandleVideoBuffer(OH_AVBuffer *buffer) {
     if (fps_ > 0) {
         int64_t interval = 1000000000LL / fps_;
         int64_t last = lastVideoNs_.load(std::memory_order_relaxed);
-        if (last != 0 && now - last < interval - interval / 10) {
+        bool drop = (last != 0 && now - last < interval - interval / 10);
+        static int diagSc = 0;
+        if (diagSc++ < 5) {
+            MS_LOG_WARN("[SC] fps=%{public}d last=%{public}lld now=%{public}lld drop=%{public}d", fps_,
+                        static_cast<long long>(last), static_cast<long long>(now), drop ? 1 : 0);
+        }
+        if (drop) {
             OH_AVBuffer_Destroy(buffer);
             return;
         }

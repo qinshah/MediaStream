@@ -105,8 +105,11 @@ private:
     void StartStatsLocked();
     void StopStatsLocked();
 
-    // 按屏幕原生分辨率确定采集/编码尺寸（原始流要求与显示器一致）
+    // 按屏幕原生分辨率确定采集尺寸（原始流要求与显示器一致）
     bool ComputeCaptureSize(int &width, int &height);
+    // 计算编码/MP4 目标尺寸：原生长边裁剪到 kEncodeLongMax，宽高取 16 对齐
+    // （OH H.264 编码器对非 16 对齐的大尺寸帧会输出错乱流 → 播放绿屏/失败）
+    static void ComputeEncodeSize(int nativeW, int nativeH, int &encW, int &encH);
 
     std::mutex mutex_; // 保护全部状态与对象生命周期
 
@@ -137,6 +140,11 @@ private:
 
     // RGBA 兜底转换暂存
     std::vector<uint8_t> rgbaToNv12Scratch_;
+
+    // 编码尺寸（可能小于采集原生尺寸）与 NV12 缩放暂存
+    int encodeWidth_ = 0;
+    int encodeHeight_ = 0;
+    std::vector<uint8_t> scaleNv12Scratch_;
     
 
     // 统计
@@ -149,6 +157,11 @@ private:
     double lastBitrateKbps_ = 0;
     int64_t lastStatsFrames_ = 0;
     int64_t lastStatsBytes_ = 0;
+
+    // 帧率节流 + 输出 PTS 基线：PTS 按「输出时刻 - 首帧输出时刻」的墙钟差生成（μs），
+    // 保证 MP4 时长/播放速度正确（编码器透传 pts 恒为 0；按帧号×间隔会因实际帧率≠fps 而失真）
+    std::atomic<int64_t> captureLastNs_{0};
+    std::atomic<int64_t> outPtsStartNs_{ -1 };
 
     // 麦克风降级检测
     std::atomic<bool> micDegraded_{false};

@@ -89,6 +89,7 @@ private:
     // 录制时长按真实墙钟计算（设备编码器 pts 绝对时钟不可靠，不能用 (last-first)/1000）
     std::atomic<int64_t> startSteadyMs_{0};
     std::atomic<int64_t> writtenBytes_{0};
+    std::atomic<int64_t> writtenSamples_{0};
     std::atomic<bool> finished_{false};
 
     int width_ = 0;

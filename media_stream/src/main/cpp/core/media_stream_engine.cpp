@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include <multimedia/player_framework/native_avscreen_capture_base.h>
 #include <multimedia/player_framework/native_avscreen_capture_errors.h>
@@ -15,6 +16,13 @@ namespace media_stream {
 
 // 音频源降级检测阈值：连续 1s 麦克风无数据
 static constexpr int kMicDegradeThresholdMs = 1000;
+
+// 单调时钟：ns（供 fps 节流与输出 PTS 生成使用）
+static int64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 MediaStreamEngine &MediaStreamEngine::Instance() {
     static MediaStreamEngine engine;
@@ -102,6 +110,85 @@ bool MediaStreamEngine::ComputeCaptureSize(int &width, int &height) {
     width = dw & ~1;
     height = dh & ~1;
     return true;
+}
+
+// —— NV12 缩放与编码尺寸 ——
+// 编码长边上限：缩到该尺寸以内，保证 16 对齐 + 解码器可解（高于此 OH H.264 编码器
+// 对非 16 对齐大帧会输出错乱流，玩家绿屏/失败）
+static constexpr int kEncodeLongMax = 1632;
+
+void MediaStreamEngine::ComputeEncodeSize(int nativeW, int nativeH, int &encW, int &encH) {
+    const int longEdge = nativeW > nativeH ? nativeW : nativeH;
+    double ratio = 1.0;
+    if (longEdge > kEncodeLongMax) {
+        ratio = static_cast<double>(kEncodeLongMax) / static_cast<double>(longEdge);
+    }
+    // 等比缩放后四舍五入并 16 对齐（H.264 宏块边界，编码器/解码器要求）
+    int w = static_cast<int>(std::lround(nativeW * ratio));
+    int h = static_cast<int>(std::lround(nativeH * ratio));
+    encW = (w + 8) & ~15;
+    encH = (h + 8) & ~15;
+    if (encW < 2) {
+        encW = 2;
+    }
+    if (encH < 2) {
+        encH = 2;
+    }
+    MS_LOG_INFO("encode size %{public}dx%{public}d from native %{public}dx%{public}d", encW, encH, nativeW, nativeH);
+}
+
+// NV12 双线性缩放：src(sw×sh) → dst(dw×dh)。Y 平面双线性；UV 为交错平面
+// （每行 sw 字节，偶奇=U/V，共 sh/2 行），按逻辑色度平面(sw/2 × sh/2)双线性采样。
+static void ScaleNv12(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh) {
+    const int srcYSize = sw * sh;
+    const int dstYSize = dw * dh;
+    const uint8_t *srcUv = src + srcYSize;
+
+    // Y 平面
+    for (int dy = 0; dy < dh; ++dy) {
+        float sy = static_cast<float>(dy) * sh / dh;
+        int y0 = static_cast<int>(sy);
+        int y1 = y0 + 1 < sh ? y0 + 1 : y0;
+        float fy = sy - y0;
+        const uint8_t *srow = src + y0 * sw;
+        const uint8_t *srow2 = src + y1 * sw;
+        uint8_t *drow = dst + dy * dw;
+        for (int dx = 0; dx < dw; ++dx) {
+            float sx = static_cast<float>(dx) * sw / dw;
+            int x0 = static_cast<int>(sx);
+            int x1 = x0 + 1 < sw ? x0 + 1 : x0;
+            float fx = sx - x0;
+            float top = srow[x0] + fx * (srow[x1] - srow[x0]);
+            float bot = srow2[x0] + fx * (srow2[x1] - srow2[x0]);
+            drow[dx] = static_cast<uint8_t>(top + fy * (bot - top));
+        }
+    }
+
+    // U/V 平面：源逻辑色度尺寸(sw/2 × sh/2)，交错步长 sw；目标(dw/2 × dh/2)
+    const int suw = sw / 2, suh = sh / 2;
+    const int duw = dw / 2, duh = dh / 2;
+    // 采样逻辑色度坐标(clamp+双线性)；off=0 取 U，off=1 取 V
+    auto chromaAt = [&](float x, float y, int off) -> int {
+        float gx = x < 0 ? 0 : (x > suw - 1 ? suw - 1 : x);
+        float gy = y < 0 ? 0 : (y > suh - 1 ? suh - 1 : y);
+        int x0 = static_cast<int>(gx), y0 = static_cast<int>(gy);
+        int x1 = x0 + 1 < suw ? x0 + 1 : x0;
+        int y1 = y0 + 1 < suh ? y0 + 1 : y0;
+        float fx = gx - x0, fy = gy - y0;
+        auto at = [&](int cx, int cy) -> int { return srcUv[cy * sw + cx * 2 + off]; };
+        float top = at(x0, y0) + fx * (at(x1, y0) - at(x0, y0));
+        float bot = at(x0, y1) + fx * (at(x1, y1) - at(x0, y1));
+        return static_cast<int>(top + fy * (bot - top));
+    };
+    for (int dy = 0; dy < duh; ++dy) {
+        float sy = static_cast<float>(dy) * suh / duh;
+        uint8_t *duv = dst + dstYSize + dy * dw;
+        for (int dx = 0; dx < duw; ++dx) {
+            float sx = static_cast<float>(dx) * suw / duw;
+            duv[dx * 2] = static_cast<uint8_t>(chromaAt(sx, sy, 0));
+            duv[dx * 2 + 1] = static_cast<uint8_t>(chromaAt(sx, sy, 1));
+        }
+    }
 }
 
 // —— 对外 API ——
@@ -218,6 +305,11 @@ bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
     if (!EnsureCapturePipelineLocked(errCode, errMsg)) {
         return false;
     }
+    // 每段录制从 0 起草 pts 基线（避免跨段复用旧起点导致原始 pts 膨胀，虽 muxer 归一化无碍，仍保持整洁）
+    outPtsStartNs_.store(-1, std::memory_order_relaxed);
+    captureLastNs_.store(0, std::memory_order_relaxed);
+    MS_LOG_WARN("[CFG] startRecording fps=%{public}d bitrate=%{public}d mode=%{public}s", config_.fps,
+                config_.videoBitrateKbps, config_.audioMode.c_str());
 
     // 编码配置齐备才真正启动 MP4；否则先标记 pendingRecord
     // 仅视频轨即可启动（系统内录音频无播放时无 ASC，录制静音画面也需能落盘）
@@ -335,12 +427,16 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
         return false;
     }
 
-    int width = 0, height = 0;
-    if (!ComputeCaptureSize(width, height)) {
+    // 采集尺寸 = 屏幕原生分辨率（原始流要求与显示器一致，否则 Init 失败/假占位）
+    int capW = 0, capH = 0;
+    if (!ComputeCaptureSize(capW, capH)) {
         errCode = static_cast<int>(EngineError::kCaptureInitFail);
         errMsg = "获取屏幕尺寸失败";
         return false;
     }
+    // 编码尺寸 = 原生长边裁剪 + 16 对齐（OH H.264 对非 16 对齐的大尺寸帧会输出错乱流 → 播放绿屏/失败）
+    ComputeEncodeSize(capW, capH, encodeWidth_, encodeHeight_);
+    scaleNv12Scratch_.resize(static_cast<size_t>(encodeWidth_) * encodeHeight_ * 3 / 2);
 
     bool micEnabled = (config_.audioMode == "mic" || config_.audioMode == "micInner");
     bool innerEnabled = (config_.audioMode == "inner" || config_.audioMode == "micInner");
@@ -349,7 +445,7 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
         : config_.audioMode == "micInner" ? AudioMixer::Mode::kMicAndInner
                                           : AudioMixer::Mode::kInnerOnly);
 
-    // 编码器先就绪，采集回调进来时可直接投递
+    // 编码器先就绪，采集回调进来时可直接投递（以缩小后的可解码编码尺寸启动）
     videoEncoder_ = std::make_unique<VideoEncoder>();
     VideoEncoder::Callbacks vcb;
     vcb.onOutput = [this](const uint8_t *d, int32_t s, int64_t pts, bool key) {
@@ -360,7 +456,7 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
         std::lock_guard<std::mutex> lk(mutex_);
         EmitError(EngineError::kEncoderError, "视频编码器出错", "videoEncoder");
     };
-    if (!videoEncoder_->Start(width, height, config_.fps, config_.videoBitrateKbps, std::move(vcb))) {
+    if (!videoEncoder_->Start(encodeWidth_, encodeHeight_, config_.fps, config_.videoBitrateKbps, std::move(vcb))) {
         videoEncoder_.reset();
         errCode = static_cast<int>(EngineError::kEncoderInitFail);
         errMsg = "视频编码器初始化失败";
@@ -403,7 +499,7 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
     };
     scb.onError = [this](int32_t code) { OnCaptureError(code); };
     scb.onUserStopped = [this]() { OnCaptureUserStopped(); };
-    if (!capture_->Start({width, height, config_.fps, micEnabled, innerEnabled}, std::move(scb))) {
+    if (!capture_->Start({capW, capH, config_.fps, micEnabled, innerEnabled}, std::move(scb))) {
         capture_.reset();
         audioEncoder_.reset();
         videoEncoder_.reset();
@@ -415,7 +511,8 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
 
     captureState_ = "active";
     EmitCaptureState("active");
-    MS_LOG_INFO("Capture pipeline up %{public}dx%{public}d", width, height);
+    MS_LOG_INFO("Capture pipeline up cap=%{public}dx%{public}d enc=%{public}dx%{public}d", capW, capH,
+                encodeWidth_, encodeHeight_);
     return true;
 }
 
@@ -478,6 +575,27 @@ void MediaStreamEngine::MaybeStopPipelineUnlocked() {
 
 void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int height, bool isNv12,
                                         int64_t ptsNs) {
+    // 帧率节流：原始流按屏幕刷新率投递（可能远高于目标 fps），在引擎侧再兜底一次，
+    // 控制编码输入速率≈目标 fps（采集回调侧节流在部分设备上不生效，实测仍 ~198fps）。
+    int fps = config_.fps > 0 ? config_.fps : 30;
+    if (fps > 0) {
+        int64_t intervalNs = 1000000000LL / fps;
+        int64_t now = NowNs();
+        int64_t last = captureLastNs_.load(std::memory_order_relaxed);
+        // 诊断：打印前若干帧的节流判定，确认本分支确实在执行
+        static int diagThr = 0;
+        bool drop = (last != 0 && now - last < intervalNs - intervalNs / 10);
+        if (diagThr++ < 5) {
+            MS_LOG_WARN("[THR] fps=%{public}d interval=%{public}lld last=%{public}lld now=%{public}lld drop=%{public}d",
+                        fps, static_cast<long long>(intervalNs), static_cast<long long>(last),
+                        static_cast<long long>(now), drop ? 1 : 0);
+        }
+        if (drop) {
+            return; // 弃帧，保持目标帧率
+        }
+        captureLastNs_.store(now, std::memory_order_relaxed);
+    }
+
     // 采集回调与管线收尾可能并发（收尾会清空 videoEncoder_），此处统一加锁读取并判空，
     // 避免悬垂指针；RGBA 暂存缓冲也在同锁内访问。
     std::lock_guard<std::mutex> lock(mutex_);
@@ -485,10 +603,15 @@ void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int heig
         return;
     }
     int64_t ptsUs = ptsNs / 1000;
-    if (isNv12) {
-        videoEncoder_->InputFrame(data, ptsUs);
-    } else {
-        // RGBA 兜底：软件转 NV12 进编码器
+    int ew = encodeWidth_, eh = encodeHeight_;
+    if (ew <= 0 || eh <= 0) {
+        ew = width;
+        eh = height;
+    }
+
+    // 先得到原生尺寸的 NV12（RGBA 时软件转换）
+    const uint8_t *nv12 = data;
+    if (!isNv12) {
         size_t need = static_cast<size_t>(width) * height * 3 / 2;
         if (rgbaToNv12Scratch_.size() < need) {
             rgbaToNv12Scratch_.resize(need);
@@ -496,8 +619,28 @@ void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int heig
         extern void RgbaToNv12(const uint8_t *, size_t, int, int, uint8_t *, uint8_t *);
         RgbaToNv12(data, static_cast<size_t>(width) * 4, width, height, rgbaToNv12Scratch_.data(),
                    rgbaToNv12Scratch_.data() + static_cast<size_t>(width) * height);
-        videoEncoder_->InputFrame(rgbaToNv12Scratch_.data(), ptsUs);
+        nv12 = rgbaToNv12Scratch_.data();
     }
+
+    // 缩放到编码尺寸（原生 → 16 对齐小尺寸），保证编码流可被播放器解码
+    if (ew != width || eh != height) {
+        if (scaleNv12Scratch_.size() < static_cast<size_t>(ew) * eh * 3 / 2) {
+            scaleNv12Scratch_.resize(static_cast<size_t>(ew) * eh * 3 / 2);
+        }
+        ScaleNv12(nv12, width, height, scaleNv12Scratch_.data(), ew, eh);
+        nv12 = scaleNv12Scratch_.data();
+    }
+
+    // [DBG] 进编码器前的最终缓冲均值/中心采样（判断是否黑帧）
+    {
+        long sum = 0; int n = ew * eh; const uint8_t *p = nv12;
+        for (int i = 0; i < n; i += ew) sum += p[i];
+        int r0 = p[0], rMid = p[(eh / 2) * ew + (ew / 2)];
+        MS_LOG_WARN("[DBG] encY meancol=%{public}ld mid=%{public}d top=%{public}d isNv12=%{public}d", sum / (ew ? eh : 1),
+                    rMid, r0, isNv12 ? 1 : 0);
+    }
+
+    videoEncoder_->InputFrame(nv12, ptsUs);
 }
 
 void MediaStreamEngine::OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
@@ -540,17 +683,30 @@ void MediaStreamEngine::OnCaptureError(int32_t errorCode) {
 }
 
 void MediaStreamEngine::OnCaptureUserStopped() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (captureState_ == "error") {
-        return;
+    Mp4Recorder *recorder = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (captureState_ == "error") {
+            return;
+        }
+        captureState_ = "idle";
+        recordState_ = "stopped";
+        streamState_ = "error";
+        EmitCaptureState("stopped");
+        EmitRecordState("stopped");
+        EmitStreamState("error");
+        MS_LOG_INFO("capture stopped by user, all outputs halted");
+        // 取出录制器指针，稍后锁外 finalize（写 moov）
+        if (mp4Recorder_) {
+            recorder = mp4Recorder_.get();
+        }
     }
-    captureState_ = "idle";
-    recordState_ = "stopped";
-    streamState_ = "error";
-    EmitCaptureState("stopped");
-    EmitRecordState("stopped");
-    EmitStreamState("error");
-    MS_LOG_INFO("capture stopped by user, all outputs halted");
+    // 用户通过系统胶囊停止录屏：必须在锁外调用 Mp4Recorder::Stop()，让写入线程执行
+    // OH_AVMuxer_Stop 写出 moov。此前只发状态不改 muxer，导致文件只有 mdat 没有 moov，
+    // 任何播放器都无法播放（无轨道/编码/时长信息）。
+    if (recorder != nullptr) {
+        recorder->Stop();
+    }
 }
 
 // —— 编码回调 ——
@@ -558,12 +714,22 @@ void MediaStreamEngine::OnCaptureUserStopped() {
 void MediaStreamEngine::OnEncodedVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe) {
     encodedVideoFrames_++;
     encodedBytes_ += size;
+    // 编码器输出 pts 实测恒为 0，不能用于时间线；改为以「输出墙钟时刻」相对「首帧输出时刻」
+    // 的差值作为 PTS（μs）。这样 MP4 时长/播放速度与实际录制经过时间一致，不依赖实际帧率
+    // （本机原始流按屏幕刷新率高频投递，采集侧节流不生效时帧率仍偏高，但 PTS 依然正确）。
+    int64_t nowNs = NowNs();
+    int64_t start = outPtsStartNs_.load();
+    if (start < 0) {
+        outPtsStartNs_.compare_exchange_strong(start, nowNs);
+        start = nowNs;
+    }
+    int64_t newPtsUs = (nowNs - start) / 1000;
     // 分发：RTMP + MP4
     if (rtmpClient_) {
-        rtmpClient_->SendVideo(data, size, ptsUs, isKeyframe);
+        rtmpClient_->SendVideo(data, size, newPtsUs, isKeyframe);
     }
     if (mp4Recorder_ && mp4Started_) {
-        mp4Recorder_->WriteVideo(data, size, ptsUs, isKeyframe);
+        mp4Recorder_->WriteVideo(data, size, newPtsUs, isKeyframe);
     }
 }
 

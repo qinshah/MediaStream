@@ -45,6 +45,7 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     firstPtsUs_ = -1;
     lastPtsUs_ = 0;
     writtenBytes_ = 0;
+    writtenSamples_ = 0;
     // 录制起点（真实墙钟，用于时长统计）
     startSteadyMs_ = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now().time_since_epoch())
@@ -88,6 +89,17 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     }
 
     // 视频轨：AVC + 宽高 + avcC
+    if (!avcC_.empty()) {
+        // 临时 dump：确认传入封装的 avcC 是否含 SPS/PPS（numSPS 应为 1）
+        std::string hex;
+        for (size_t i = 0; i < avcC_.size() && i < 16; i++) {
+            char b[4];
+            snprintf(b, sizeof(b), "%02x", avcC_[i]);
+            hex += b;
+        }
+        uint8_t ns = avcC_.size() >= 6 ? (avcC_[5] & 0x1F) : 0xFF;
+        MS_LOG_WARN("[HEX] avcC->muxer n=%{public}zu prefix=%{public}s numSPS=%{public}d", avcC_.size(), hex.c_str(), ns);
+    }
     OH_AVFormat *vfmt = OH_AVFormat_Create();
     OH_AVFormat_SetStringValue(vfmt, OH_MD_KEY_CODEC_MIME, OH_AVCODEC_MIMETYPE_VIDEO_AVC);
     OH_AVFormat_SetIntValue(vfmt, OH_MD_KEY_WIDTH, width_);
@@ -226,21 +238,40 @@ bool Mp4Recorder::WriteOneSample(const Sample &sample) {
     if (attr.pts < 0) {
         attr.pts = 0;
     }
+    // 临时诊断：首/尾及每1000样本记录 ptsUs 与归零后 pts，判断时间线是否异常
+    int64_t cnt = writtenSamples_.load();
+    if (cnt < 3 || cnt % 1000 == 0) {
+        MS_LOG_WARN("[PTS] sample#%{public}lld rawPtsUs=%{public}lld firstPtsUs=%{public}lld normPts=%{public}lld",
+                    cnt, sample.ptsUs, firstPtsUs_.load(), attr.pts);
+    }
     attr.size = static_cast<int32_t>(sample.data.size());
     attr.offset = 0;
     attr.flags = sample.flags;
     OH_AVBuffer_SetBufferAttr(buffer, &attr);
+
+    // 临时：dump 前3个视频样本首8字节，确认 AVCC(length prefix) 还是 Annex-B(start code)
+    if (sample.isVideo && writtenSamples_.load() < 3 && sample.data.size() >= 8) {
+        char h[17];
+        for (int i = 0; i < 8; i++) {
+            snprintf(h + i * 2, 3, "%02x", sample.data[i]);
+        }
+        h[16] = 0;
+        MS_LOG_WARN("[HEX] video sample[%{public}lld] sz=%{public}zu head=%{public}s", writtenSamples_.load(),
+                    sample.data.size(), h);
+    }
 
     int32_t track = sample.isVideo ? videoTrack_ : audioTrack_;
     int32_t rc = OH_AVMuxer_WriteSampleBuffer(muxer_, track, buffer);
     OH_AVBuffer_Destroy(buffer);
     if (rc != AV_ERR_OK) {
         // 常见为存储不足
-        MS_LOG_ERROR("WriteSampleBuffer failed rc=%{public}d", rc);
+        MS_LOG_ERROR("WriteSampleBuffer failed rc=%{public}d track=%{public}d size=%{public}d", rc, track,
+                     sample.data.size());
         storageError_ = true;
         return false;
     }
     writtenBytes_ += sample.data.size();
+    writtenSamples_++;
     int64_t last = lastPtsUs_.load();
     if (sample.ptsUs > last) {
         lastPtsUs_.store(sample.ptsUs);
@@ -259,7 +290,12 @@ void Mp4Recorder::WriteThreadMain() {
 
     // 安全收尾：Stop 写 moov → Destroy → close(fd)
     if (muxer_ != nullptr) {
-        OH_AVMuxer_Stop(muxer_);
+        int32_t s = OH_AVMuxer_Stop(muxer_);
+        if (s != AV_ERR_OK) {
+            MS_LOG_ERROR("OH_AVMuxer_Stop failed rc=%{public}d (moov 未写出，文件将不可播放)", s);
+        } else {
+            MS_LOG_INFO("OH_AVMuxer_Stop ok, moov written");
+        }
         OH_AVMuxer_Destroy(muxer_);
         muxer_ = nullptr;
     }
@@ -283,8 +319,9 @@ void Mp4Recorder::WriteThreadMain() {
         result.sizeBytes = writtenBytes_.load();
     }
     result.normal = !storageError_.load();
-    MS_LOG_INFO("Mp4Recorder finished: %{public}s %{public}lldms %{public}lldB normal=%{public}d",
-                filePath_.c_str(), result.durationMs, result.sizeBytes, result.normal ? 1 : 0);
+    MS_LOG_INFO("Mp4Recorder finished: %{public}s %{public}lldms %{public}lldB samples=%{public}lld normal=%{public}d",
+                filePath_.c_str(), result.durationMs, result.sizeBytes, writtenSamples_.load(),
+                result.normal ? 1 : 0);
     if (storageError_.load() && callbacks_.onError) {
         callbacks_.onError(kErrStorageFull, "存储空间不足，录制已停止");
     }

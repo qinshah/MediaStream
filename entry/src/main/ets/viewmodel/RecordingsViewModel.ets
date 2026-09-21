@@ -1,6 +1,7 @@
 // 录制列表视图模型：加载/删除/分享/清理操作编排（US4/T027）
-import { common, Want, wantConstant } from '@kit.AbilityKit';
+import { common } from '@kit.AbilityKit';
 import { fileUri } from '@kit.CoreFileKit';
+import { systemShare } from '@kit.ShareKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RecordingsRepository, RecordingItem } from '../data/RecordingsRepository';
 
@@ -57,23 +58,23 @@ export class RecordingsViewModel {
     this.recordings = RecordingsRepository.getInstance().current();
   }
 
-  // 系统分享（ACTION_SEND_DATA + FLAG_GRANT_READ_URI_PERMISSION；失败返回 false 由视图降级 toast）
+  // 系统分享（Share Kit：SharedData + ShareController，DETAIL 预览；接收方获得临时读权限，
+  // 可把沙箱里的 MP4 真正导出到文件管理/其他应用做分析）
   async share(path: string): Promise<boolean> {
     const ctx = this.context;
     if (!ctx) {
       return false;
     }
     try {
-      const want: Want = {
-        action: 'ohos.want.action.sendData',
-        type: 'video/mp4',
+      const record: systemShare.SharedRecord = {
+        utd: 'general.video', // UDMF 统一数据类型：视频
         uri: fileUri.getUriFromPath(path),
-        flags: wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION,
-        parameters: {
-          'ohos.userFile.manager.BundleName': ctx.abilityInfo.bundleName,
-        },
+        title: '录制视频',
+        label: 'VIDEO',
       };
-      await ctx.startAbility(want);
+      const data = new systemShare.SharedData(record);
+      const controller = new systemShare.ShareController(data);
+      await controller.show(ctx, { previewMode: systemShare.SharePreviewMode.DETAIL });
       return true;
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'share %{public}s err %{public}s', path, JSON.stringify(e));

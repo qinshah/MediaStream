@@ -1,5 +1,6 @@
 #include "video_encoder.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include <multimedia/player_framework/native_averrors.h>
@@ -14,6 +15,22 @@ namespace media_stream {
 // H.264 NALU type
 static constexpr int kNalSps = 7;
 static constexpr int kNalPps = 8;
+
+// 临时：dump 一段字节的 hex，用于排查 avcC 是否完整(是否含 SPS/PPS, numSPS 是否=1)
+static void DumpHex(const char *tag, const uint8_t *p, size_t n) {
+    if (p == nullptr || n == 0) {
+        MS_LOG_WARN("[HEX] %{public}s empty", tag);
+        return;
+    }
+    const size_t kShow = n > 16 ? 16 : n;
+    char buf[64];
+    for (size_t i = 0; i < kShow; i++) {
+        snprintf(buf + i * 2, 3, "%02x", p[i]);
+    }
+    buf[kShow * 2] = 0;
+    uint8_t ns = n >= 6 ? (p[5] & 0x1F) : 0xFF; // numSPS byte(索引5)
+    MS_LOG_WARN("[HEX] %{public}s n=%{public}zu prefix=%{public}s numSPS=%{public}d", tag, n, buf, ns);
+}
 
 VideoEncoder::~VideoEncoder() {
     Stop();
@@ -207,10 +224,18 @@ void VideoEncoder::OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *fmt, void *us
     size_t configSize = 0;
     if (OH_AVFormat_GetBuffer(fmt, OH_MD_KEY_CODEC_CONFIG, &config, &configSize) && config != nullptr &&
         configSize > 0 && !self->avccEmitted_) {
-        self->avcc_.assign(config, config + configSize);
-        self->avccEmitted_ = true;
-        if (self->callbacks_.onCodecConfig) {
-            self->callbacks_.onCodecConfig(self->avcc_);
+        // 若该 config 是 Annex-B(起始码开头)，则用 ExtractAvcc 正规提取 SPS/PPS；
+        // 否则视为已是标准 AVCC record，直接采用。
+        bool isAnnexB = configSize >= 4 && config[0] == 0 && config[1] == 0 &&
+                        (config[2] == 1 || (config[2] == 0 && config[3] == 1));
+        if (isAnnexB) {
+            self->ExtractAvcc(config, configSize);
+        } else {
+            self->avcc_.assign(config, config + configSize);
+            self->avccEmitted_ = true;
+            if (self->callbacks_.onCodecConfig) {
+                self->callbacks_.onCodecConfig(self->avcc_);
+            }
         }
         MS_LOG_INFO("avcC from output description, %{public}zu bytes", configSize);
     }
@@ -241,14 +266,12 @@ void VideoEncoder::OnNeedOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBu
         int32_t size = attr.size;
 
         if ((attr.flags & AVCODEC_BUFFER_FLAGS_CODEC_DATA) != 0) {
-            // codec config 缓冲：内容即 avcC
+            // codec config 缓冲：OH 编码器返回的通常是「Annex-B 起始码 + SPS/PPS NALU」，
+            // 并非标准 AVCC record。若直接当作 OH_MD_KEY_CODEC_CONFIG 传给封装器，会写出
+            // 缺少 SPS/PPS 的 avcC，导致任何解码器都无法初始化（黑屏/绿屏/无法播放）。
+            // 因此这里用 ExtractAvcc 从该 Annex-B 里正规提取 SPS/PPS 并构造标准 avcC。
             if (!self->avccEmitted_ && size > 0) {
-                self->avcc_.assign(data, data + size);
-                self->avccEmitted_ = true;
-                if (self->callbacks_.onCodecConfig) {
-                    self->callbacks_.onCodecConfig(self->avcc_);
-                }
-                MS_LOG_INFO("avcC from codec data buffer, %{public}d bytes", size);
+                self->ExtractAvcc(data, size); // 内部成功时会设置 avccEmitted_ 并回调 onCodecConfig
             }
             OH_VideoEncoder_FreeOutputBuffer(codec, index);
             return;
@@ -367,6 +390,7 @@ void VideoEncoder::ExtractAvcc(const uint8_t *data, int32_t size) {
 
     avcc_ = std::move(avcc);
     avccEmitted_ = true;
+    DumpHex("avcC extractAvcc", avcc_.data(), avcc_.size());
     if (callbacks_.onCodecConfig) {
         callbacks_.onCodecConfig(avcc_);
     }
