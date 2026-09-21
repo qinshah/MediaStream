@@ -206,9 +206,12 @@ bool VideoEncoder::FillSlotLocked(uint32_t index, OH_AVBuffer *buffer) {
                    static_cast<size_t>(width_));
         }
     }
+    // frame 是 pendingFrames_.front() 的引用，pop_front() 之后即悬垂。先把长度取出来再出队，
+    // 否则下面那条日志会读已释放的内存（实测恒打印 size=0，排查帧率问题时给出完全错误的方向）。
+    const size_t frameSize = frame.size();
     OH_AVCodecBufferAttr attr = {};
     attr.pts = pendingPtsUs_.front();
-    attr.size = static_cast<int32_t>(frame.size());
+    attr.size = static_cast<int32_t>(frameSize);
     attr.offset = 0;
     attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
     OH_AVBuffer_SetBufferAttr(buffer, &attr);
@@ -217,7 +220,7 @@ bool VideoEncoder::FillSlotLocked(uint32_t index, OH_AVBuffer *buffer) {
     if (pushedCnt_ < 3) {
         pushedCnt_++;
         MS_LOG_INFO("pushed input frame #%{public}d via callback (index=%{public}u size=%{public}zu)", pushedCnt_,
-                    index, frame.size());
+                    index, frameSize);
     }
     return true;
 }

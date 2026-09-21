@@ -30,6 +30,15 @@ add_library(media_stream SHARED
     rtmp/flv_packager.cpp
 )
 
+# Debug 构建强制开优化。
+# 起因（真机实测）：默认 Debug 配置为 `-O0 -g`，而本项目最重的热路径是每帧必跑的
+# capture/screen_capture.cpp 的 RGBA 行距紧凑化 + core/media_stream_engine.cpp 的
+# RgbaToNv12Scaled（720x1632 约 117 万像素，内层是查表 + 整数矩阵运算）。-O0 下该
+# 路径实测约 90~100ms/帧，直接把有效帧率锁死在 ~10fps：配置 60fps 却只出 4~5 帧/秒，
+# 画面表现为「几乎不动 / 卡在某一帧」。同为 Debug 的联调构建必须开优化才有参考价值。
+# 保留 -g（调试信息不丢），只把优化级别抬到 -O2。
+target_compile_options(media_stream PRIVATE $<$<CONFIG:Debug>:-O2>)
+
 # 链接 OHOS 系统能力库（全部来自 SDK sysroot，零三方依赖）
 target_link_libraries(media_stream PUBLIC
     libace_napi.z.so
