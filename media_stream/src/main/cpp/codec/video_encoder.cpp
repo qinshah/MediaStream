@@ -1,12 +1,15 @@
 #include "video_encoder.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
 #include <multimedia/player_framework/native_averrors.h>
+#include <multimedia/player_framework/native_avcodec_base.h>
 #include <multimedia/player_framework/native_avcodec_videoencoder.h>
 #include <multimedia/player_framework/native_avbuffer.h>
 #include <multimedia/player_framework/native_avformat.h>
+#include <native_buffer/native_buffer.h>
 
 #include "../common/logger.h"
 
@@ -99,6 +102,8 @@ bool VideoEncoder::Start(int width, int height, int fps, int bitrateKbps, Callba
         return false;
     }
     running_ = true;
+    aliveFlag_.store(true);
+    lastKeyReqMs_.store(0); // 首帧即请求 IDR，保证流一开始就有可解码的随机访问点
     MS_LOG_INFO("VideoEncoder started %{public}dx%{public}d@%{public}d %{public}dkbps", width, height, fps,
                 bitrateKbps);
     return true;
@@ -108,11 +113,15 @@ void VideoEncoder::InputFrame(const uint8_t *nv12, int64_t ptsUs) {
     if (nv12 == nullptr) {
         return;
     }
+    OH_AVCodec *enc = nullptr;
+    uint32_t pushIdx = 0;
+    bool push = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!running_ || encoder_ == nullptr) {
             return;
         }
+        enc = encoder_; // 供锁外请求 IDR（Push 路径也会赋值，此处保证无 Push 时同样可用）
         int32_t need = width_ * height_ * 3 / 2;
         // 队列有界：队满丢最旧一帧（不背压采集）
         if (pendingFrames_.size() >= kMaxPendingFrames) {
@@ -121,7 +130,96 @@ void VideoEncoder::InputFrame(const uint8_t *nv12, int64_t ptsUs) {
         }
         pendingFrames_.emplace_back(nv12, nv12 + need);
         pendingPtsUs_.push_back(ptsUs);
+        // 已有暂留输入槽 → 立即填回并投递，避免真实帧在队列里空等下一次回调
+        if (idleIndex_ >= 0 && idleBuffer_ != nullptr) {
+            uint32_t idx = static_cast<uint32_t>(idleIndex_);
+            OH_AVBuffer *buf = idleBuffer_;
+            idleIndex_ = -1;
+            idleBuffer_ = nullptr;
+            if (FillSlotLocked(idx, buf)) {
+                enc = encoder_;
+                pushIdx = idx;
+                push = true;
+            }
+        }
     }
+    // Push 必须在锁外：OH_VideoEncoder_PushInputBuffer 可能同步触发编码器回调，
+    // 而回调要取本 mutex_，持锁 Push 会自锁（与 OnNeedOutputBuffer 的锁序修复同源）。
+    if (push) {
+        OH_VideoEncoder_PushInputBuffer(enc, pushIdx);
+    }
+    // 按时间请求 IDR（锁外，避免与编码器回调线程形成锁序问题）
+    MaybeRequestKeyFrame(enc);
+}
+
+// 将队首帧写入输入槽（须持 mutex_）。容量不足时保留该帧、交由调用方转为暂留槽。
+bool VideoEncoder::FillSlotLocked(uint32_t index, OH_AVBuffer *buffer) {
+    if (buffer == nullptr || pendingFrames_.empty()) {
+        return false;
+    }
+    uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
+    int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
+    const std::vector<uint8_t> &frame = pendingFrames_.front();
+    if (addr == nullptr || capacity < static_cast<int32_t>(frame.size())) {
+        MS_LOG_WARN("video input slot too small cap=%{public}d need=%{public}zu", capacity, frame.size());
+        return false;
+    }
+
+    // 输入槽可能带行距填充（stride > width）。编码器按 stride 逐行寻址，若我们按紧凑
+    // width 连续整块写入，Y/UV 平面立即错位：画面斜向撕裂，且尾部未被覆盖的区域整段读到 0
+    // （Y=U=V=0 → 解码纯绿）。真机实测 720x1632 时底部约 1/6 解出绿块、上方严重斜条纹。
+    // NV12 的 Y 与 UV 都是 1 字节/样本，因此 stride 无论以字节还是像素给出，只要 >= width
+    // 就可直接当作「字节/行」使用。
+    size_t yStride = static_cast<size_t>(width_);
+    size_t uvStride = static_cast<size_t>(width_);
+    OH_NativeBuffer *nb = OH_AVBuffer_GetNativeBuffer(buffer);
+    if (nb != nullptr) {
+        OH_NativeBuffer_Config cfg = {};
+        OH_NativeBuffer_GetConfig(nb, &cfg);
+        if (slotLogged_ < 2) {
+            slotLogged_++;
+            MS_LOG_WARN("[VENC] input slot cfg w=%{public}d h=%{public}d stride=%{public}d fmt=%{public}d "
+                        "usage=%{public}d cap=%{public}d need=%{public}zu",
+                        cfg.width, cfg.height, cfg.stride, cfg.format, cfg.usage, capacity, frame.size());
+        }
+        if (cfg.stride >= width_) {
+            yStride = static_cast<size_t>(cfg.stride);
+            uvStride = yStride;
+        }
+    }
+    const size_t yBytes = yStride * static_cast<size_t>(height_);
+    const size_t uvBytes = uvStride * (static_cast<size_t>(height_) / 2);
+    if (uvStride == static_cast<size_t>(width_) || capacity < static_cast<int32_t>(yBytes + uvBytes)) {
+        // 无行距填充（或槽容量装不下带行距的布局）：按紧凑布局整块写入
+        memcpy(addr, frame.data(), frame.size());
+    } else {
+        // 带行距：逐行搬运 Y 与 UV 两个平面
+        const uint8_t *srcY = frame.data();
+        const uint8_t *srcUV = frame.data() + static_cast<size_t>(width_) * height_;
+        for (int row = 0; row < height_; row++) {
+            memcpy(addr + static_cast<size_t>(row) * yStride, srcY + static_cast<size_t>(row) * width_,
+                   static_cast<size_t>(width_));
+        }
+        uint8_t *dstUV = addr + yBytes;
+        for (int row = 0; row < height_ / 2; row++) {
+            memcpy(dstUV + static_cast<size_t>(row) * uvStride, srcUV + static_cast<size_t>(row) * width_,
+                   static_cast<size_t>(width_));
+        }
+    }
+    OH_AVCodecBufferAttr attr = {};
+    attr.pts = pendingPtsUs_.front();
+    attr.size = static_cast<int32_t>(frame.size());
+    attr.offset = 0;
+    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+    OH_AVBuffer_SetBufferAttr(buffer, &attr);
+    pendingFrames_.pop_front();
+    pendingPtsUs_.pop_front();
+    if (pushedCnt_ < 3) {
+        pushedCnt_++;
+        MS_LOG_INFO("pushed input frame #%{public}d via callback (index=%{public}u size=%{public}zu)", pushedCnt_,
+                    index, frame.size());
+    }
+    return true;
 }
 
 void VideoEncoder::Stop() {
@@ -134,11 +232,41 @@ void VideoEncoder::Stop() {
         enc = encoder_;
         encoder_ = nullptr;
         running_ = false;
+        aliveFlag_.store(false); // 先失效再销毁，避免锁外请求 IDR 触到已释放编码器
+        // 暂留槽随编码器销毁失效，置空避免悬垂
+        idleIndex_ = -1;
+        idleBuffer_ = nullptr;
+        pendingFrames_.clear();
+        pendingPtsUs_.clear();
     }
     if (enc != nullptr) {
         OH_VideoEncoder_Stop(enc);
         OH_VideoEncoder_Destroy(enc);
         MS_LOG_INFO("VideoEncoder stopped");
+    }
+}
+
+void VideoEncoder::MaybeRequestKeyFrame(OH_AVCodec *enc) {
+    if (enc == nullptr || !aliveFlag_.load()) {
+        return;
+    }
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    int64_t last = lastKeyReqMs_.load();
+    if (last != 0 && nowMs - last < kKeyFrameIntervalMs) {
+        return;
+    }
+    lastKeyReqMs_.store(nowMs);
+    OH_AVFormat *fmt = OH_AVFormat_Create();
+    if (fmt == nullptr) {
+        return;
+    }
+    OH_AVFormat_SetIntValue(fmt, OH_MD_KEY_REQUEST_I_FRAME, 1);
+    OH_AVErrCode rc = OH_VideoEncoder_SetParameter(enc, fmt);
+    OH_AVFormat_Destroy(fmt);
+    if (rc != AV_ERR_OK) {
+        MS_LOG_WARN("request IDR failed rc=%{public}d", rc);
     }
 }
 
@@ -153,64 +281,31 @@ void VideoEncoder::OnCodecError(OH_AVCodec *codec, int32_t errorCode, void *user
     }
 }
 
-// 输入缓冲回调：从待编码队列取出一帧 NV12，拷入编码器输入缓冲并 Push
+// 输入缓冲回调：从待编码队列取出一帧 NV12，拷入编码器输入缓冲并 Push。
+// 队列为空时**暂留**该输入槽（不 Push）——见头文件 idleIndex_ 处对绿屏根因的说明。
 void VideoEncoder::OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer, void *userData) {
     auto *self = static_cast<VideoEncoder *>(userData);
-    if (self == nullptr) {
+    if (self == nullptr || buffer == nullptr) {
         return;
     }
-    std::vector<uint8_t> frame;
-    int64_t ptsUs = 0;
-    bool hasFrame = false;
+    bool push = false;
     {
         std::lock_guard<std::mutex> lock(self->mutex_);
         if (!self->running_ || self->encoder_ == nullptr) {
             return;
         }
-        if (!self->pendingFrames_.empty()) {
-            frame = std::move(self->pendingFrames_.front());
-            self->pendingFrames_.pop_front();
-            ptsUs = self->pendingPtsUs_.front();
-            self->pendingPtsUs_.pop_front();
-            hasFrame = true;
+        push = self->FillSlotLocked(index, buffer);
+        if (!push) {
+            // 无帧可编（或槽容量不足）：把槽暂留下来，等 InputFrame 有真实帧再填回。
+            // 已在暂留中则忽略本次回调（最多只持一个槽，与 AudioEncoder 策略一致）。
+            if (self->idleIndex_ < 0) {
+                self->idleIndex_ = static_cast<int32_t>(index);
+                self->idleBuffer_ = buffer;
+            }
+            return;
         }
     }
-    if (!hasFrame || buffer == nullptr) {
-        // 无待编码帧：仍 Push 一个 0 长度缓冲占位，避免编码器等待（与音频编码器行为一致）
-        OH_AVCodecBufferAttr empty = {};
-        empty.pts = 0;
-        empty.size = 0;
-        empty.flags = AVCODEC_BUFFER_FLAGS_NONE;
-        if (buffer != nullptr) {
-            OH_AVBuffer_SetBufferAttr(buffer, &empty);
-        }
-        OH_VideoEncoder_PushInputBuffer(codec, index);
-        return;
-    }
-    uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
-    int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
-    if (addr == nullptr || capacity < static_cast<int32_t>(frame.size())) {
-        OH_AVCodecBufferAttr empty = {};
-        empty.pts = 0;
-        empty.size = 0;
-        empty.flags = AVCODEC_BUFFER_FLAGS_NONE;
-        OH_AVBuffer_SetBufferAttr(buffer, &empty);
-        OH_VideoEncoder_PushInputBuffer(codec, index);
-        return;
-    }
-    memcpy(addr, frame.data(), frame.size());
-    OH_AVCodecBufferAttr attr = {};
-    attr.pts = ptsUs;
-    attr.size = static_cast<int32_t>(frame.size());
-    attr.offset = 0;
-    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-    OH_AVBuffer_SetBufferAttr(buffer, &attr);
     OH_VideoEncoder_PushInputBuffer(codec, index);
-    if (self->pushedCnt_ < 3) {
-        self->pushedCnt_++;
-        MS_LOG_INFO("pushed input frame #%{public}d via callback (index=%{public}u size=%{public}zu)", self->pushedCnt_,
-                    index, frame.size());
-    }
 }
 
 void VideoEncoder::OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *fmt, void *userData) {

@@ -7,6 +7,7 @@
 //    SPS/PPS 提取生成 avcC（同时供 MP4 OH_MD_KEY_CODEC_CONFIG 与 RTMP sequence header）
 //  - 关键帧间隔 2s（GOP），CBR 码率控制
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -61,11 +62,20 @@ private:
     // Annex-B → AVCC：扫描 start code 切分 NALU，输出 4 字节大端长度前缀
     // 返回 false 表示输入已是 AVCC（直接透传）
     bool ConvertAnnexBToAvcc(const uint8_t *data, int32_t size, std::vector<uint8_t> &out);
+    // 按时间周期性请求 IDR 关键帧（锁外调用）
+    void MaybeRequestKeyFrame(OH_AVCodec *enc);
     // 从 Annex-B NALU 流提取 SPS/PPS 并构建 avcC
     void ExtractAvcc(const uint8_t *data, int32_t size);
 
     OH_AVCodec *encoder_ = nullptr;
     Callbacks callbacks_;
+    // 关键帧（IDR）按时间主动请求，不依赖 I_FRAME_INTERVAL 的按帧数语义：
+    // 该参数文档为「每 (frameRate * value)/1000 帧一个关键帧」，而本场景投递受屏幕内容变化
+    // 驱动、实际帧率可低至 1~4fps，按帧数折算出的 GOP 时间跨度可达数十秒 —— 新接入的播放器
+    // 等不到 IDR 就无法解码（真机实测 8s 推流仅含 1 个 I 帧，ffplay 表现为 vq=0KB 卡住黑屏）。
+    static constexpr int64_t kKeyFrameIntervalMs = 2000;
+    std::atomic<int64_t> lastKeyReqMs_{0};
+    std::atomic<bool> aliveFlag_{false}; // 锁外调用 OH 接口前的存活校验
     std::mutex mutex_; // 保护 encoder_ 生命周期（Stop 与回调并发）
     bool running_ = false;
     int width_ = 0;
@@ -73,11 +83,25 @@ private:
     bool avccEmitted_ = false;
     std::vector<uint8_t> avcc_;
     std::vector<uint8_t> convertScratch_; // Annex-B→AVCC 转换暂存
+    // 将 pendingFrames_ 队首帧写入指定输入槽并 SetBufferAttr（须持 mutex_）。
+    // 成功返回 true 并弹出该帧；槽容量不足返回 false（该帧保留，槽转为暂留）。
+    bool FillSlotLocked(uint32_t index, OH_AVBuffer *buffer);
+
     // 待编码帧队列：采集线程入队，onNeedInputBuffer 回调线程出队（drop-if-busy，上限 4 帧）
     static constexpr size_t kMaxPendingFrames = 4;
     std::deque<std::vector<uint8_t>> pendingFrames_;
     std::deque<int64_t> pendingPtsUs_;
-    int pushedCnt_ = 0; // 调试：已成功投递帧计数
+
+    // 输入槽暂留（关键修复：绿屏根因）
+    // 队列为空时**绝不** Push 0 长输入缓冲：OH 硬件编码器会把未写入（全 0）的输入
+    // 缓冲当成真实帧编码，以数百 fps 自转产出 45B 空白帧。这些垃圾帧会污染参考帧链
+    // 并占据时间轴，播放时整段解码为 YUV(0,0,0) → RGB(0,135,0) 纯绿（真机实测
+    // 2256/6403 帧为空白帧，文件前 10s 全绿）。改为暂留输入槽，等 InputFrame 拿到
+    // 真实帧后填回再 Push（与 AudioEncoder 同构）。
+    int32_t idleIndex_ = -1;
+    OH_AVBuffer *idleBuffer_ = nullptr;
+    int pushedCnt_ = 0;   // 调试：已成功投递帧计数
+    int slotLogged_ = 0;  // 调试：输入槽 native buffer 配置只打前 2 次
 };
 
 } // namespace media_stream
