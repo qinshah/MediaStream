@@ -58,6 +58,11 @@ private:
     int64_t droppedInner_ = 0;
     int64_t droppedMic_ = 0;
     void DropOldestLocked(std::deque<int16_t> &q, int64_t &dropped, const char *tag);
+
+    // 混音诊断（每 64 块打一条 [MIX-DIAG]）：用来区分「电音」是两路同源相加的梳状滤波，
+    // 还是真的削波/丢样本。diagBlocks_ 为累计块数。
+    int64_t diagBlocks_ = 0;
+    void DiagMixLocked(int64_t eInner, int64_t eMic, int64_t cross, int spill, int32_t peak);
 };
 
 } // namespace media_stream
