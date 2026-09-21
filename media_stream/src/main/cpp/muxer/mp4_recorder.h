@@ -95,6 +95,9 @@ private:
     std::atomic<int64_t> lastPtsUs_{0};
     // 录制时长按真实墙钟计算（设备编码器 pts 绝对时钟不可靠，不能用 (last-first)/1000）
     std::atomic<int64_t> startSteadyMs_{0};
+    // 写线程收尾时刻（0=尚未收尾）。收尾后 DurationMs() 固定返回 stop-start，
+    // 避免「文件已写完 moov、但另一个输出还在跑」时界面上的录制时长继续上涨。
+    std::atomic<int64_t> stopSteadyMs_{0};
     std::atomic<int64_t> writtenBytes_{0};
     std::atomic<int64_t> writtenSamples_{0};
     std::atomic<bool> finished_{false};

@@ -32,6 +32,25 @@ static int64_t NowNs() {
         .count();
 }
 
+// 单调时钟：ms（时长统计口径，与 streamStartMs_ 一致）
+int64_t MediaStreamEngine::SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// 采集回调时间戳（steady ns，绝对值）→ 会话相对。视频侧由本函数换算后当 PTS 用，音频侧
+// 把换算结果交给编码器当时间轴起点，两者因此共用同一原点（不再出现「音频 88s、视频 0s」）。
+int64_t MediaStreamEngine::SessionRelativeNs(int64_t absNs) {
+    int64_t start = sessionStartNs_.load(std::memory_order_relaxed);
+    if (start < 0) {
+        // 管线尚未建立（理论上不会发生：回调只在管线活着时触发）：退回绝对时间
+        return absNs;
+    }
+    int64_t rel = absNs - start;
+    return rel < 0 ? 0 : rel;
+}
+
 MediaStreamEngine &MediaStreamEngine::Instance() {
     static MediaStreamEngine engine;
     return engine;
@@ -303,18 +322,22 @@ bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::
                 streamState_ = "streaming";
                 EmitStreamState("streaming");
                 streamStartMs_ = -1; // 下个统计周期重新计时
+                streamStopMs_ = 0;   // 重连成功即恢复计时
                 break;
             case RtmpClient::State::kReconnecting:
                 streamState_ = "reconnecting";
                 EmitStreamState("reconnecting", attempt);
                 break;
             case RtmpClient::State::kStopped:
+                // 先冻结再改状态：终值必须由「已停止」这一刻决定，之后统计线程只转发该值
+                FreezeStreamDurationLocked();
                 if (streamState_ != "error") {
                     streamState_ = "idle";
                     EmitStreamState("idle");
                 }
                 break;
             case RtmpClient::State::kError:
+                FreezeStreamDurationLocked();
                 streamState_ = "error";
                 EmitStreamState("error");
                 break;
@@ -393,9 +416,11 @@ bool MediaStreamEngine::StartRecording(const Config &config, int &errCode, std::
     if (!EnsureCapturePipelineLocked(errCode, errMsg)) {
         return false;
     }
-    // 每段录制从 0 起草 pts 基线（避免跨段复用旧起点导致原始 pts 膨胀，虽 muxer 归一化无碍，仍保持整洁）
-    outPtsStartNs_.store(-1, std::memory_order_relaxed);
-    captureLastNs_.store(0, std::memory_order_relaxed);
+    // 不再在此重置 PTS 原点：会话时间轴在管线建立时确定（见 EnsureCapturePipelineLocked）。
+    // 旧实现在这里把视频原点清 -1，而音频时间轴来自仍在运行的音频编码器，两者于是错源：
+    // 真机实测「先推流、后开始录制」时同一文件里音频 rawPts=88.85s / 视频 rawPts=0，录制开头
+    // 缺掉约 2.8s 画面（界面计时已到 3s，视频才 1s）。MP4 侧本就按首采样归零，无需清基线。
+    recordFinalMs_.store(-1, std::memory_order_relaxed);
     MS_LOG_WARN("[CFG] startRecording fps=%{public}d bitrate=%{public}d mode=%{public}s", config_.fps,
                 config_.videoBitrateKbps, config_.audioMode.c_str());
 
@@ -521,6 +546,11 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
     // 每次会话都要重置降级判定；captureActiveNs_ 要等 STARTED 回调（用户授权后）才填
     micDegraded_ = false;
     captureActiveNs_.store(-1, std::memory_order_relaxed);
+    // 会话时间轴原点：管线建立即确定，此后音频/视频/MP4/RTMP 全部以它为基准，会话内不再重置。
+    // 关键点是「不随单个输出的起停而重置」——否则后启动的那一路（例如先推流、后开始录制）
+    // 会拿到另一个原点，音视频时间戳错源，录制文件开头就会缺一段画面。
+    sessionStartNs_.store(NowNs(), std::memory_order_relaxed);
+    captureLastNs_.store(0, std::memory_order_relaxed);
 
     // 编码器先就绪，采集回调进来时可直接投递（以缩小后的可解码编码尺寸启动）
     videoEncoder_ = std::make_unique<VideoEncoder>();
@@ -614,6 +644,11 @@ void MediaStreamEngine::TeardownPipelineUnlocked() {
         asc_.clear();
         mp4Started_ = false;
         pendingVideo_.clear();
+        // 缓存帧随管线作废（尺寸可能随新会话的画质预设变化）
+        lastFrameValid_ = false;
+        lastFrameW_ = 0;
+        lastFrameH_ = 0;
+        lastFrame_.clear();
     }
     if (cap) {
         cap->Stop();
@@ -647,11 +682,17 @@ void MediaStreamEngine::MaybeStopPipelineUnlocked() {
     // TeardownPipelineUnlocked 锁内 std::move 剥离对象、锁外执行 Stop，天然线程安全且幂等。
     std::thread teardownThread([this]() {
         TeardownPipelineUnlocked();
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (captureState_ != "idle") {
-            captureState_ = "idle";
-            EmitCaptureState("idle");
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // 兜底：任何一条停止路径漏了冻结，这里也会把推流时长定格，不让它继续涨
+            FreezeStreamDurationLocked();
+            if (captureState_ != "idle") {
+                captureState_ = "idle";
+                EmitCaptureState("idle");
+            }
         }
+        // StopStatsLocked 必须在锁外：它 join 统计线程，而统计线程会取 mutex_，
+        // 持锁 join 就是「持锁者等 join、被 join 者等锁」的确定性死锁。
         StopStatsLocked();
     });
     teardownThread.detach();
@@ -743,7 +784,34 @@ void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int heig
         }
     }
 
+    // 缓存最近一帧（编码尺寸 NV12），供「输出起点补帧」使用。采集侧已按目标 fps 节流，
+    // 因此这里的拷贝开销被限制在 fps 次/秒。
+    const size_t needBytes = static_cast<size_t>(ew) * eh * 3 / 2;
+    if (lastFrame_.size() != needBytes) {
+        lastFrame_.resize(needBytes);
+    }
+    memcpy(lastFrame_.data(), nv12, needBytes);
+    lastFrameW_ = ew;
+    lastFrameH_ = eh;
+    lastFrameValid_ = true;
+
     videoEncoder_->InputFrame(nv12, ptsUs);
+}
+
+// 补投缓存帧：让「后启动的输出」视频轨从 0 就有画面（详见头文件 lastFrame_ 说明）。
+// 只投编码器（不直接投推流/封装器），帧的时间戳仍由 OnEncodedVideo 按墙钟生成。
+void MediaStreamEngine::SubmitLastFrameLocked(const char *why) {
+    if (!lastFrameValid_ || videoEncoder_ == nullptr || lastFrame_.empty()) {
+        return;
+    }
+    // 尺寸校验：跨会话换过画质预设时旧缓存尺寸不匹配，投进去会越界读
+    if (lastFrameW_ != encodeWidth_ || lastFrameH_ != encodeHeight_) {
+        return;
+    }
+    int64_t ptsUs = SessionRelativeNs(NowNs()) / 1000;
+    MS_LOG_INFO("submit cached frame at output start (%{public}s) ptsUs=%{public}lld size=%{public}zu", why,
+                static_cast<long long>(ptsUs), lastFrame_.size());
+    videoEncoder_->InputFrame(lastFrame_.data(), ptsUs);
 }
 
 void MediaStreamEngine::OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
@@ -758,17 +826,19 @@ void MediaStreamEngine::OnCapturedInnerAudio(const uint8_t *pcm, int32_t bytes, 
     // 音频路由按会话模式收口：mic 模式下系统仍会投递内录缓冲（audioSource=OH_APP_PLAYBACK），
     // 若无条件灌进编码器，同一时刻会同时吃掉「内录 + 麦克风」两路 PCM，采样点数翻倍。
     // 真机实测：音频轨时长 857s vs 视频 521s（1.65 倍），音画必然失步。
+    // 时间戳统一换算到会话原点：音频与视频共用一把时钟，避免两侧时间轴错源。
+    const int64_t relNs = SessionRelativeNs(ptsNs);
     const std::string &mode = config_.audioMode;
     if (mode == "micInner") {
         if (mixer_) {
-            mixer_->PushInner(pcm, bytes, ptsNs);
+            mixer_->PushInner(pcm, bytes, relNs);
         }
         return;
     }
     if (mode == "mic") {
         return; // 只用麦克风，丢弃内录
     }
-    audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, ptsNs);
+    audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, relNs);
 }
 
 void MediaStreamEngine::OnCapturedMicAudio(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
@@ -780,17 +850,18 @@ void MediaStreamEngine::OnCapturedMicAudio(const uint8_t *pcm, int32_t bytes, in
     if (audioEncoder_ == nullptr) {
         return;
     }
+    const int64_t relNs = SessionRelativeNs(ptsNs);
     const std::string &mode = config_.audioMode;
     if (mode == "micInner") {
         if (mixer_) {
-            mixer_->PushMic(pcm, bytes, ptsNs);
+            mixer_->PushMic(pcm, bytes, relNs);
         }
         return;
     }
     if (mode != "mic") {
         return; // inner 模式丢弃麦克风，避免与内录双路叠加
     }
-    audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, ptsNs);
+    audioEncoder_->InputPcm(reinterpret_cast<const int16_t *>(pcm), bytes, relNs);
 }
 
 void MediaStreamEngine::OnCaptureError(int32_t errorCode) {
@@ -821,6 +892,9 @@ void MediaStreamEngine::OnCaptureUserStopped() {
         captureState_ = "idle";
         recordState_ = "stopped";
         streamState_ = "error";
+        // 采集被系统停止属于「意外中断」：推流随之作废，时长必须在此定格（否则统计线程仍在，
+        // 界面上的推流时长会继续涨到用户手动清理为止）
+        FreezeStreamDurationLocked();
         EmitCaptureState("stopped");
         EmitRecordState("stopped");
         EmitStreamState("error");
@@ -843,16 +917,20 @@ void MediaStreamEngine::OnCaptureUserStopped() {
 void MediaStreamEngine::OnEncodedVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe) {
     encodedVideoFrames_++;
     encodedBytes_ += size;
-    // 编码器输出 pts 实测恒为 0，不能用于时间线；改为以「输出墙钟时刻」相对「首帧输出时刻」
-    // 的差值作为 PTS（μs）。这样 MP4 时长/播放速度与实际录制经过时间一致，不依赖实际帧率
-    // （本机原始流按屏幕刷新率高频投递，采集侧节流不生效时帧率仍偏高，但 PTS 依然正确）。
-    int64_t nowNs = NowNs();
-    int64_t start = outPtsStartNs_.load();
-    if (start < 0) {
-        outPtsStartNs_.compare_exchange_strong(start, nowNs);
-        start = nowNs;
+    // 编码器输出 pts 实测恒为 0，不能用于时间线；改为取「输出墙钟相对会话原点」的差值（μs）。
+    // 与音频侧共用同一原点（sessionStartNs_），这样 MP4 与 RTMP 都不会再出现音视频时间戳错源。
+    // 用墙钟差而非「帧号×帧间隔」，是为保证 MP4 时长/播放速度与实际经过时间一致
+    // （本机原始流按屏幕刷新率投递，实际帧率≠配置 fps，按帧号算必然失真）。
+    int64_t newPtsUs = SessionRelativeNs(NowNs()) / 1000;
+    // 诊断：视频时间轴取样（前 3 帧 + 每 200 帧）
+    {
+        static std::atomic<int> vc{0};
+        int n = vc.fetch_add(1);
+        if (n < 3 || n % 200 == 0) {
+            MS_LOG_WARN("[VENC-OUT] #%{public}d ptsUs=%{public}lld key=%{public}d size=%{public}d", n,
+                        static_cast<long long>(newPtsUs), isKeyframe ? 1 : 0, size);
+        }
     }
-    int64_t newPtsUs = (nowNs - start) / 1000;
     // 分发：RTMP + MP4。RTMP 侧取锁内快照（本回调线程不持锁，裸读 rtmpClient_ 有 UAF 风险）
     std::shared_ptr<RtmpClient> rtmp = RtmpSnapshotLocked();
     if (rtmp) {
@@ -943,8 +1021,12 @@ void MediaStreamEngine::StartMuxerLocked() {
         // 锁外收尾管线，避免写线程持锁调用阻断式 Stop 与回调加锁死锁
         {
             std::lock_guard<std::mutex> lk(mutex_);
+            // 录制时长终值只认「写线程真正收尾」这一刻给出的 result.durationMs：
+            // 之后即使统计线程还在跑（另一个输出仍在继续），也只转发这个冻结值，不再按 now 累加。
+            recordFinalMs_.store(result.durationMs, std::memory_order_relaxed);
             recordState_ = "stopped";
             EmitRecordState("stopped");
+            EmitStatsLocked(false); // 立即把终值推给 UI（统计线程可能紧接着就会退出）
             EmitRecordFinishedEvent(result);
         }
         MaybeStopPipelineUnlocked();
@@ -965,6 +1047,8 @@ void MediaStreamEngine::StartMuxerLocked() {
         return;
     }
     mp4Started_ = true;
+    // 录制起点补帧：屏幕静止时采集侧不产帧，补投缓存帧让视频轨从 0 就有画面
+    SubmitLastFrameLocked("record");
     // muxer 已启动：把等待 ASC 期间缓存的视频帧灌入写队列（flush）
     const size_t flushed = pendingVideo_.size();
     while (!pendingVideo_.empty()) {
@@ -1002,50 +1086,84 @@ void MediaStreamEngine::OnRecordFinished(const Mp4Recorder::Result &result) {
 
 // —— 统计线程 ——
 
-void MediaStreamEngine::StatsThreadMain() {
-    while (statsRunning_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if (!statsRunning_.load() || emitter_ == nullptr) {
-            continue;
-        }
-        EventData e;
-        e.type = EventType::kStats;
+// 组装并上报一条统计事件（须持 mutex_ 调用）。
+// withRates=true：带瞬时 fps/码率（统计线程每 500ms 调一次）；false：只带时长等累计量，
+// 用于停止回调里立刻把「时长终值」推给 UI —— 统计线程可能马上就要退出，不能指望它再发一次。
+void MediaStreamEngine::EmitStatsLocked(bool withRates) {
+    if (emitter_ == nullptr) {
+        return;
+    }
+    EventData e;
+    e.type = EventType::kStats;
 
-        int64_t frames = encodedVideoFrames_.load();
-        int64_t bytes = encodedBytes_.load();
-        double dt = 0.5;
+    if (withRates) {
+        const int64_t frames = encodedVideoFrames_.load();
+        const int64_t bytes = encodedBytes_.load();
+        const double dt = 0.5; // 统计线程周期
         e.hasVideoFps = true;
         e.videoFps = (frames - lastStatsFrames_) / dt;
         e.hasVideoBitrate = true;
         e.videoBitrateKbps = (bytes - lastStatsBytes_) * 8.0 / 1000.0 / dt;
         lastStatsFrames_ = frames;
         lastStatsBytes_ = bytes;
+    }
 
-        std::shared_ptr<RtmpClient> rtmp = RtmpSnapshotLocked();
-        if (rtmp) {
-            e.hasSentBytes = true;
-            e.sentBytes = rtmp->SentBytes();
-            e.hasDroppedFrames = true;
-            e.droppedVideoFrames = rtmp->DroppedVideoFrames();
-            if (streamStartMs_ < 0) {
-                // 记下推流真正的起始时刻（steady 毫秒）。此前赋 0 会让「推流时长」变成
-                // steady_clock 自 epoch 起的绝对值（真机实测显示成设备开机时长 32588:48）。
-                streamStartMs_ = static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count());
-            }
-            e.hasStreamDuration = true;
-            e.streamDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now().time_since_epoch())
-                                     .count() -
-                                 streamStartMs_;
+    if (rtmpClient_) {
+        e.hasSentBytes = true;
+        e.sentBytes = rtmpClient_->SentBytes();
+        e.hasDroppedFrames = true;
+        e.droppedVideoFrames = rtmpClient_->DroppedVideoFrames();
+    }
+
+    // 推流时长：只在「推流确实在跑」时按墙钟推进；一旦停止/出错，就只转发停止回调里冻结的
+    // 终值。旧实现无条件按 now 计算，推流意外中断（RTMP 报错、采集被系统停止）后 rtmpClient_
+    // 仍在、统计线程仍在，界面上的时长就会一直涨下去。
+    const bool streamRunning = streamState_ == "streaming" || streamState_ == "reconnecting";
+    const int64_t stopMs = streamStopMs_.load(std::memory_order_relaxed);
+    if (streamRunning) {
+        if (streamStartMs_.load() < 0) {
+            // 记下推流真正的起始时刻（steady 毫秒）。此前赋 0 会让「推流时长」变成
+            // steady_clock 自 epoch 起的绝对值（真机实测显示成设备开机时长 32588:48）。
+            streamStartMs_.store(SteadyMs());
         }
-        if (mp4Recorder_ && mp4Started_) {
-            e.hasRecordDuration = true;
-            e.recordDurationMs = mp4Recorder_->DurationMs();
+        e.hasStreamDuration = true;
+        e.streamDurationMs = SteadyMs() - streamStartMs_.load();
+    } else if (stopMs > 0 && streamStartMs_.load() > 0) {
+        e.hasStreamDuration = true;
+        e.streamDurationMs = stopMs - streamStartMs_.load();
+    }
+
+    // 录制时长：写线程收尾前按墙钟推进；收尾后固定为 result.durationMs（onFinished 里落值）
+    const int64_t recordFinal = recordFinalMs_.load(std::memory_order_relaxed);
+    if (recordFinal >= 0) {
+        e.hasRecordDuration = true;
+        e.recordDurationMs = recordFinal;
+    } else if (mp4Started_ && mp4Recorder_) {
+        e.hasRecordDuration = true;
+        e.recordDurationMs = mp4Recorder_->DurationMs();
+    }
+    emitter_->Emit(std::move(e));
+}
+
+// 冻结推流时长终值并即时上报（幂等）。只在「推流已停止 / 出错」的回调里调用。
+void MediaStreamEngine::FreezeStreamDurationLocked() {
+    if (streamStartMs_.load() <= 0 || streamStopMs_.load() > 0) {
+        return; // 从未真正开播，或已经冻结过
+    }
+    streamStopMs_.store(SteadyMs(), std::memory_order_relaxed);
+    EmitStatsLocked(false);
+}
+
+void MediaStreamEngine::StatsThreadMain() {
+    while (statsRunning_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (!statsRunning_.load() || emitter_ == nullptr) {
+            continue;
         }
-        emitter_->Emit(std::move(e));
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            EmitStatsLocked(true);
+        }
 
         // muxer 启动兜底重试：avcC 就绪后即可启动（音频轨恒建，ASC 有定值兜底），此处仅防漏
         if (pendingRecord_ && !mp4Started_) {
@@ -1076,11 +1194,13 @@ void MediaStreamEngine::StatsThreadMain() {
 
 void MediaStreamEngine::StartStatsLocked() {
     if (statsRunning_.exchange(true)) {
-        return;
+        return; // 统计线程已在跑（后启动的那个输出不重置计时）
     }
     lastStatsFrames_ = 0;
     lastStatsBytes_ = 0;
     streamStartMs_ = -1;
+    streamStopMs_ = 0;
+    recordFinalMs_ = -1;
     statsThread_ = std::thread(&MediaStreamEngine::StatsThreadMain, this);
 }
 

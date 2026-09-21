@@ -45,6 +45,7 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     writeThreadDone_ = false;
     firstPtsUs_ = -1;
     lastPtsUs_ = 0;
+    stopSteadyMs_ = 0;
     writtenBytes_ = 0;
     writtenSamples_ = 0;
     // 录制起点（真实墙钟，用于时长统计）
@@ -203,15 +204,20 @@ void Mp4Recorder::WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
 }
 
 int64_t Mp4Recorder::DurationMs() const {
-    // 以真实墙钟计算录制时长（编码器绝对 pts 时钟不可靠，避免转换成极不合理的时长）
+    // 以真实墙钟计算录制时长（编码器绝对 pts 时钟不可靠，避免转换成极不合理的时长）。
+    // 写线程收尾时记下 stopSteadyMs_，之后固定返回该终值：否则文件写完 moov 后，
+    // 只要还有别的输出在继续，界面上的录制时长仍会随 now 一直涨。
     int64_t start = startSteadyMs_.load();
     if (start <= 0) {
         return 0;
     }
-    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count();
-    return now - start;
+    int64_t stop = stopSteadyMs_.load();
+    if (stop <= 0) {
+        stop = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count();
+    }
+    return stop > start ? stop - start : 0;
 }
 
 void Mp4Recorder::Stop() {
@@ -256,10 +262,21 @@ bool Mp4Recorder::WriteOneSample(const Sample &sample) {
     if (first < 0) {
         firstPtsUs_.compare_exchange_strong(first, sample.ptsUs);
         first = sample.ptsUs;
+        // 诊断：归零点由「第一个被写入的样本」决定（音频先到则等于音频首包时间戳）
+        MS_LOG_WARN("[MP4-BASE] firstPtsUs=%{public}lld from %{public}s", static_cast<long long>(first),
+                    sample.isVideo ? "video" : "audio");
     }
     attr.pts = sample.ptsUs - first;
     if (attr.pts < 0) {
         attr.pts = 0;
+        // 诊断：负值被钳到 0 —— 说明该样本早于归零点（时间戳错序），播放时会堆在同一时刻
+        static std::atomic<int> negCtr{0};
+        int nc = negCtr.fetch_add(1);
+        if (nc < 3 || nc % 500 == 0) {
+            MS_LOG_WARN("[MP4-NEG] %{public}s rawPtsUs=%{public}lld < firstPtsUs=%{public}lld (clamped to 0, n=%{public}d)",
+                        sample.isVideo ? "video" : "audio", static_cast<long long>(sample.ptsUs),
+                        static_cast<long long>(first), nc);
+        }
     }
     // 临时诊断：首/尾及每1000样本记录 ptsUs 与归零后 pts，判断时间线是否异常
     int64_t cnt = writtenSamples_.load();
@@ -321,6 +338,11 @@ void Mp4Recorder::WriteThreadMain() {
     }
 
     // 安全收尾：Stop 写 moov → Destroy → close(fd)
+    // 先定格录制时长：这一刻之后不再代表真实录制内容（后面只是封装收尾），
+    // 也让 onFinished 给出的 durationMs 与界面上的终值完全一致。
+    stopSteadyMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
     if (muxer_ != nullptr) {
         MS_LOG_WARN("[MUX] OH_AVMuxer_Stop before (moov)");
         int32_t s = OH_AVMuxer_Stop(muxer_);

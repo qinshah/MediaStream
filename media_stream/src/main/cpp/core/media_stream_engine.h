@@ -116,6 +116,15 @@ private:
     void StatsThreadMain();
     void StartStatsLocked();
     void StopStatsLocked();
+    // 组装并上报一条统计事件（须持 mutex_ 调用）。withRates=false 用于停止回调里只推终值，
+    // 不带瞬时速率（瞬时速率由 UI 在状态回到空闲时清零）。
+    void EmitStatsLocked(bool withRates);
+    // 在「推流已停止/出错」的回调里冻结推流时长终值并即时上报（幂等）
+    void FreezeStreamDurationLocked();
+    // 单调时钟毫秒（与 streamStartMs_/Mp4Recorder 的时长口径一致）
+    static int64_t SteadyMs();
+    // 采集回调的绝对时间戳（steady ns）换算到会话原点；音频侧与视频共用同一原点
+    int64_t SessionRelativeNs(int64_t absNs);
 
     // 按屏幕原生分辨率确定采集尺寸（原始流要求与显示器一致）
     bool ComputeCaptureSize(int &width, int &height);
@@ -169,6 +178,18 @@ private:
     int encodeHeight_ = 0;
     std::vector<uint8_t> scaleNv12Scratch_;
 
+    // ── 输出起点补帧 ──
+    // 录屏采集由「屏幕内容变化」驱动：屏幕静止时采集侧根本不产帧。于是「采集已在跑、之后
+    // 才点录制」时，视频轨开头会空一段（真机实测：文件里第一帧出现在 11.3s，播放时前 11s
+    // 只有声音没有画面，用户看到的就是「录制的第一秒，屏幕上的计时已经跑到 3s」）。
+    // 这里缓存最近一帧编码尺寸 NV12，在输出（录制）起点补投一次，让视频轨从 0 就有画面。
+    std::vector<uint8_t> lastFrame_;
+    int lastFrameW_ = 0;
+    int lastFrameH_ = 0;
+    bool lastFrameValid_ = false;
+    // 补投缓存帧（须持 mutex_）
+    void SubmitLastFrameLocked(const char *why);
+
     // 最近邻采样索引表（目标行/列 → 源行/列）。预建一次即可，避免内层循环里做整数除法：
     // debug 构建(-O0)下每像素一次除法就能把单帧转换拖到数百毫秒。
     int scaleTableSrcW_ = 0, scaleTableSrcH_ = 0, scaleTableDstW_ = 0, scaleTableDstH_ = 0;
@@ -182,17 +203,26 @@ private:
     std::atomic<int64_t> encodedVideoFrames_{0};
     std::atomic<int64_t> encodedBytes_{0};
     std::atomic<int64_t> streamStartMs_{-1};
+    // 推流时长冻结时刻（steady ms；0=未冻结）。只在「推流已停止/出错」回调里落值：
+    // 若照旧每 500ms 按 now 计算，推流一旦意外中断（RTMP 报错、采集被系统停止）rtmpClient_
+    // 仍在、统计线程仍在跑，界面上的时长会一直涨下去。
+    std::atomic<int64_t> streamStopMs_{0};
+    // 录制时长终值（onFinished 的 result.durationMs；-1=本段录制尚未产出终值）
+    std::atomic<int64_t> recordFinalMs_{-1};
     double lastFps_ = 0;
     double lastBitrateKbps_ = 0;
     int64_t lastStatsFrames_ = 0;
     int64_t lastStatsBytes_ = 0;
 
-    // 帧率节流 + 输出 PTS 基线：PTS 按「输出时刻 - 首帧输出时刻」的墙钟差生成（μs），
-    // 保证 MP4 时长/播放速度正确（编码器透传 pts 恒为 0；按帧号×间隔会因实际帧率≠fps 而失真）
+    // 帧率节流 + 会话时间轴原点。
+    // 全链路只共用这一把时钟：视频 PTS = (输出墙钟 - 原点)，音频的采集时间戳也换算到同一
+    // 原点后再喂编码器。此前视频用「本会话首帧输出墙钟」、音频则沿用编码器自有时钟，两者
+    // 原点能相差几十秒（真机抓到同一录制文件里音频 rawPts=88.85s、视频 rawPts=0），时间戳
+    // 被夹到 0 或跳到远端 → 播放器为对齐而反复丢/补帧（听感即电音），录制文件开头也缺画面。
     std::atomic<int64_t> captureLastNs_{0};
     std::atomic<int> dumpFrames_{0}; // [DBG] 采集原始 RGBA 抽样帧计数（限前3帧）
     std::atomic<int> dbgFrameCtr_{0}; // [DBG] 进编码器缓冲采样计数（降频：每 30 帧一条）
-    std::atomic<int64_t> outPtsStartNs_{ -1 };
+    std::atomic<int64_t> sessionStartNs_{-1}; // 管线启动即确定，会话内不再重置
 
     // 麦克风降级检测
     std::atomic<bool> micDegraded_{false};
