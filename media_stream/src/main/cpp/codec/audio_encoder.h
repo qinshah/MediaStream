@@ -80,11 +80,12 @@ private:
     int64_t latestFedPtsUs_ = 0; // 最近一次喂入的 pts（用于前跳对齐）
     static constexpr int64_t kAacFrameUs = 1024000000LL / 48000; // 1024 采样 = 21333μs
     // 输出时间轴前跳阈值。
-    // 原为 100ms，过小：采集时钟与标称 48kHz 存在约 1.5% 偏差（[SC-AUD] 实测每包 20.30ms
-    // 而非 20.00ms），而输出时间轴按采样数推进（每帧 21.333ms）、喂入时间按真实时钟走，
-    // 两者每秒漂约 15ms —— 约 7 秒就顶到 100ms 阈值，输出时间轴周期性前跳 100ms+。
-    // 播放器为此反复丢/补帧，听感就是周期性「电音」。放宽到 2s 后正常漂移不再触发，
-    // 只有采集真断过（>2s 空洞）才前跳对齐。
+    // 曾一度调到 100ms，理由是「采集时钟比标称 48kHz 慢约 1.5%」—— 该结论是**误判**：
+    // 当时依据的 [SC-AUD] 把窗口间隔数写成了常数 63（首个窗口恰好是 63，其后每个窗口实际
+    // 累计 64 个间隔），于是 avgDelta 被系统性放大约 1.6%（20.00ms→20.32ms）。
+    // 用「包序 n 与墙上时间戳」直接复核可证：n=64→320 共 256 包 / 5.120s = **20.000ms/包**
+    // × 960 帧 = 恰好 48000Hz，采集率本来就是准的。
+    // 保留 2s：正常回调抖动（<1 包）绝不会触发，只有采集真断过留下的空洞才前跳对齐。
     static constexpr int64_t kOutResyncUs = 2000000;
 
     void MarkFedLocked(int64_t ptsUs); // 记录喂入时间轴（须持 mutex_）
@@ -101,7 +102,19 @@ private:
     // 不占用音频时间轴。
     bool primed_ = false;       // 是否已投递过静音垫
     bool realPcmSeen_ = false;  // 是否已喂入外部真实 PCM（true 后静音垫产物不再丢弃）
-    static constexpr size_t kPrimingSamples = 960 * 2; // 20ms @48k 双声道
+
+    // ── AAC 整帧投递（关键约束）──
+    // OH_AudioEncoder 把**每个输入缓冲当作一个完整 AAC 帧**处理：AAC-LC 一帧固定 1024 个采样点/
+    // 声道，双声道即 2048 个 int16（4096 字节）。若投递的缓冲不足一帧，编码器仍按整帧编码，
+    // 多出来的采样点读的是缓冲尾部**未写入**的内容。
+    // 真机实测（采集一包 3840 字节 = 960 立体声帧，比 1024 帧少 64）：每帧尾部 64 个采样塌成近零
+    // （原始 L 值从 ±2300 跌到 ±100，持续 64 采样 ≈ 1.33ms），随后立刻恢复满幅 —— 该空洞以
+    // 1024/48000s = 21.33ms 为周期重复，即 **46.875Hz 的周期性空洞**，听感正是「电音」；
+    // 且只在有声音时可闻（静音时空洞与静音无异），完全对应「说话时才叠加出电音、安静时没有」。
+    // 因此本类只按整帧投递：不足一帧先攒在 pcmQueue_，够整帧才 PushInputData。
+    static constexpr size_t kAacFrameSamplesPerCh = 1024;                     // AAC-LC 每帧采样点/声道
+    static constexpr size_t kAacFrameInt16 = kAacFrameSamplesPerCh * 2;       // 2048 int16 = 4096B
+    static constexpr size_t kPrimingSamples = kAacFrameInt16; // 静音垫也必须整帧，否则首帧同样带空洞
 
     bool ascEmitted_ = false;
     std::vector<uint8_t> asc_;

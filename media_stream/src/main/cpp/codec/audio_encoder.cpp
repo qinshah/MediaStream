@@ -142,7 +142,17 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
             int32_t capacity = OH_AVMemory_GetSize(idleMem_);
             size_t maxSamples = static_cast<size_t>(capacity) / 2;
             size_t n = pcmQueue_.size() < maxSamples ? pcmQueue_.size() : maxSamples;
-            n &= ~static_cast<size_t>(1);
+            // 整帧投递：向下取整到 kAacFrameInt16 的整数倍（见头文件说明）。
+            // 不足一帧时 n=0 → 不 Push，等下一包凑满整帧，避免编码器按整帧读越界内容成空洞。
+            size_t unit = kAacFrameInt16;
+            if (maxSamples < unit) {
+                unit = maxSamples & ~static_cast<size_t>(1); // 容量连一帧都放不下：退化为声道对对齐
+            }
+            if (unit > 0) {
+                n -= n % unit;
+            } else {
+                n = 0;
+            }
             if (addr != nullptr && capacity > 0 && n > 0) {
                 for (size_t i = 0; i < n; i++) {
                     reinterpret_cast<int16_t *>(addr)[i] = pcmQueue_[i];
@@ -170,8 +180,8 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
         static std::atomic<int> inCtr{0};
         int ic = inCtr.fetch_add(1);
         if (ic < 3 || ic % 1000 == 0) {
-            MS_LOG_WARN("[AENC-IN] #%{public}d fedPtsUs=%{public}d samples=%{public}d", ic, pushPtsUs,
-                        pushSize / 2);
+            MS_LOG_WARN("[AENC-IN] #%{public}d fedPtsUs=%{public}d int16=%{public}d frames=%{public}d",
+                        ic, pushPtsUs, pushSize / 2, pushSize / 4);
         }
         OH_AudioEncoder_PushInputData(encoder_, static_cast<uint32_t>(pushIdx), attr);
     }
@@ -255,12 +265,28 @@ void AudioEncoder::OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
         if (self->idleIndex_ >= 0) {
             return;
         }
+        // 一次性诊断：输入缓冲容量决定了每次能投几帧。若 capacity 不是 4096 的整数倍，
+        // 说明帧长假设有变（AAC 变体/声道数变化），必须重新核对整帧投递逻辑。
+        static std::atomic<bool> capLogged{false};
+        if (!capLogged.exchange(true)) {
+            MS_LOG_WARN("[AENC-CAP] input buffer capacity=%{public}d bytes (一帧 %{public}zu B)",
+                        capacity, kAacFrameInt16 * 2);
+        }
         if (self->running_ && !self->pcmQueue_.empty()) {
-            // 填充尽可能多的 PCM（偶数采样对齐，保证声道对完整）
+            // 填充尽可能多的 PCM，但**必须是整帧**：不足一帧时留下等下一包（走下面的 hold 分支），
+            // 绝不能投半帧 —— 否则编码器按整帧读缓冲尾部未写入内容，每帧尾部出现周期性空洞。
             size_t availSamples = self->pcmQueue_.size();
             size_t maxSamples = static_cast<size_t>(capacity) / 2;
             size_t samples = availSamples < maxSamples ? availSamples : maxSamples;
-            samples &= ~static_cast<size_t>(1); // 双声道对齐
+            size_t unit = kAacFrameInt16;
+            if (maxSamples < unit) {
+                unit = maxSamples & ~static_cast<size_t>(1); // 容量不足一帧：退化为声道对对齐
+            }
+            if (unit > 0) {
+                samples -= samples % unit;
+            } else {
+                samples = 0;
+            }
             if (samples > 0) {
                 for (size_t i = 0; i < samples; i++) {
                     reinterpret_cast<int16_t *>(addr)[i] = self->pcmQueue_[i];
