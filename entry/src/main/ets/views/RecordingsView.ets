@@ -39,6 +39,30 @@ export struct RecordingsView {
     });
   }
 
+  // 清空全部录制：二次确认（文件与索引一并删除，不可恢复）
+  presentClearAll(): void {
+    const n = this.vm.recordings.length;
+    if (n === 0) {
+      return;
+    }
+    this.getUIContext().showAlertDialog({
+      title: '清空录制列表',
+      message: `确定删除全部 ${n} 个录制文件吗？文件与列表索引会被一并清除，且无法恢复。`,
+      primaryButton: {
+        value: '全部删除',
+        action: () => {
+          this.vm.clearAll();
+          this.getUIContext().getPromptAction().showToast({ message: '已清空录制列表' });
+        },
+      },
+      secondaryButton: {
+        value: '取消',
+        action: () => {
+        },
+      },
+    });
+  }
+
   onShare(path: string): void {
     this.vm.share(path).then((ok: boolean) => {
       if (!ok) {
@@ -67,6 +91,23 @@ export struct RecordingsView {
 
   build() {
     Column() {
+      // —— 列表头：文件计数 + 一键清空 ——
+      Row() {
+        Text(`共 ${this.vm.recordings.length} 个文件`)
+          .fontSize(13)
+          .fontColor('#888888')
+        Blank()
+        Button('清空')
+          .fontSize(13)
+          .height(32)
+          .backgroundColor('#D93026')
+          .enabled(this.vm.recordings.length > 0)
+          .opacity(this.vm.recordings.length > 0 ? 1 : 0.4)
+          .onClick(() => this.presentClearAll())
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 8, bottom: 4 })
+
       if (this.vm.errorText.length > 0) {
         Text(this.vm.errorText)
           .fontSize(13)

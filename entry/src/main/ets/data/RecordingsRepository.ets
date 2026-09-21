@@ -151,6 +151,40 @@ export class RecordingsRepository {
     this.persist();
   }
 
+  // 清空全部录制：删除 videos 目录下所有 mp4（含未入索引的孤儿）并清空索引。
+  // 与 cleanup() 的区别：cleanup 只删「无效（孤儿/缺失）」项，本方法删全部，不可恢复。
+  clearAll(): void {
+    for (const it of this.items_) {
+      try {
+        fileIo.unlinkSync(it.filePath);
+      } catch (e) {
+        hilog.info(DOMAIN, TAG, 'clearAll unlink %{public}s err %{public}s', it.filePath, JSON.stringify(e));
+      }
+    }
+    this.items_ = [];
+    // 索引可能已丢失（重启后未刷新），目录里仍有 mp4：按目录扫一遍兜底，
+    // 否则这些文件下次 refresh 又会被标成「无效残留」冒出来。
+    if (this.filesDir_.length > 0) {
+      try {
+        const videosDir = `${this.filesDir_}/videos`;
+        for (const n of fileIo.listFileSync(videosDir)) {
+          if (!n.endsWith('.mp4')) {
+            continue;
+          }
+          try {
+            fileIo.unlinkSync(`${videosDir}/${n}`);
+          } catch (e) {
+            hilog.info(DOMAIN, TAG, 'clearAll unlink dir entry %{public}s err %{public}s', n, JSON.stringify(e));
+          }
+        }
+      } catch (e) {
+        hilog.info(DOMAIN, TAG, 'clearAll list dir err %{public}s', JSON.stringify(e));
+      }
+    }
+    this.persist();
+    hilog.info(DOMAIN, TAG, 'all recordings cleared');
+  }
+
   // —— 索引持久化（纯文本行式，避免 JSON 解析类型问题）——
   private loadIndex(): Map<string, RecordingItem> {
     const map: Map<string, RecordingItem> = new Map<string, RecordingItem>();

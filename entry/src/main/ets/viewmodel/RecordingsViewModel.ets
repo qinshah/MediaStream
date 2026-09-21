@@ -58,6 +58,13 @@ export class RecordingsViewModel {
     this.recordings = RecordingsRepository.getInstance().current();
   }
 
+  // 清空全部录制（文件 + 索引）；调用前需视图侧二次确认
+  clearAll(): void {
+    this.playingPath = ''; // 正在预览的文件也会被删除，先收起播放器
+    RecordingsRepository.getInstance().clearAll();
+    this.recordings = RecordingsRepository.getInstance().current();
+  }
+
   // 系统分享（Share Kit：SharedData + ShareController，DETAIL 预览；接收方获得临时读权限，
   // 可把沙箱里的 MP4 真正导出到文件管理/其他应用做分析）
   async share(path: string): Promise<boolean> {
