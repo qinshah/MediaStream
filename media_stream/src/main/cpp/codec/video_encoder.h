@@ -8,6 +8,7 @@
 //  - 关键帧间隔 2s（GOP），CBR 码率控制
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <vector>
@@ -51,6 +52,10 @@ private:
     // OH_AVCodecCallback 静态桥接
     static void OnCodecError(OH_AVCodec *codec, int32_t errorCode, void *userData);
     static void OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *userData);
+    // 输入缓冲回调：硬件编码器仅支持回调驱动投递（QueryInputBuffer 拉取在真机返回 rc=2 不可用），
+    // 在此回调中取出一帧排队的 NV12 帧推入编码器
+    // 签名与 OH_AVCodecOnNeedInputBuffer 对齐：(codec, index, OH_AVBuffer*, userData)
+    static void OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer, void *userData);
     static void OnNeedOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer, void *userData);
 
     // Annex-B → AVCC：扫描 start code 切分 NALU，输出 4 字节大端长度前缀
@@ -68,6 +73,11 @@ private:
     bool avccEmitted_ = false;
     std::vector<uint8_t> avcc_;
     std::vector<uint8_t> convertScratch_; // Annex-B→AVCC 转换暂存
+    // 待编码帧队列：采集线程入队，onNeedInputBuffer 回调线程出队（drop-if-busy，上限 4 帧）
+    static constexpr size_t kMaxPendingFrames = 4;
+    std::deque<std::vector<uint8_t>> pendingFrames_;
+    std::deque<int64_t> pendingPtsUs_;
+    int pushedCnt_ = 0; // 调试：已成功投递帧计数
 };
 
 } // namespace media_stream

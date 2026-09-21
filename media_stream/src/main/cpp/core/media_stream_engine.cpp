@@ -202,16 +202,19 @@ bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::
 }
 
 void MediaStreamEngine::StopStreaming() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (rtmpClient_) {
-        rtmpClient_->Stop();
-        rtmpClient_.reset();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (rtmpClient_) {
+            rtmpClient_->Stop();
+            rtmpClient_.reset();
+        }
+        if (streamState_ != "error") {
+            streamState_ = "idle";
+            EmitStreamState("stopped");
+        }
     }
-    if (streamState_ != "error") {
-        streamState_ = "idle";
-        EmitStreamState("stopped");
-    }
-    MaybeStopPipelineLocked();
+    // 管线收尾放到锁外（OH_*_Stop 在锁外执行，避免与采集/编码回调线程锁互斥量死锁）
+    MaybeStopPipelineUnlocked();
 }
 
 bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
@@ -232,15 +235,20 @@ bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
     }
 
     // 编码配置齐备才真正启动 MP4；否则先标记 pendingRecord
-    if (!avcC_.empty() && !asc_.empty() && !mp4Started_) {
+    // 仅视频轨即可启动（系统内录音频无播放时无 ASC，录制静音画面也需能落盘）
+    if (!avcC_.empty() && !mp4Started_) {
         mp4Recorder_ = std::make_unique<Mp4Recorder>();
         Mp4Recorder::Callbacks mcb;
         mcb.onFinished = [this](const Mp4Recorder::Result &result) {
-            std::lock_guard<std::mutex> lk(mutex_);
-            recordState_ = "stopped";
-            EmitRecordState("stopped");
-            EmitRecordFinishedEvent(result);
-            MaybeStopPipelineLocked();
+            // 仅在该锁内更新状态并派发事件，随后释放锁；管线（OH_*_Stop）收尾放到锁外执行，
+            // 避免在写线程（正在被主线程 join）上持锁调用阻断式 Stop 造成锁序反转死锁。
+            {
+                std::lock_guard<std::mutex> lk(mutex_);
+                recordState_ = "stopped";
+                EmitRecordState("stopped");
+                EmitRecordFinishedEvent(result);
+            }
+            MaybeStopPipelineUnlocked();
         };
         mcb.onError = [this](int code, const std::string &message) {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -273,31 +281,48 @@ bool MediaStreamEngine::StartRecording(int &errCode, std::string &errMsg) {
 }
 
 void MediaStreamEngine::StopRecording() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pendingRecord_ = false;
-    if (mp4Recorder_) {
-        mp4Recorder_->Stop(); // 触发异步 onFinished
+    // 勿在持有 mutex_ 时调用 mp4Recorder_->Stop()：Stop 内部会 join 写线程，
+    // 而写线程收尾会回调 onFinished 并重新 lock(mutex_)。若持锁 join 必然死锁，
+    // 导致主/JS 线程无限阻塞，被系统 THREAD_BLOCK_6S 判冻结并杀进程。
+    // 因此这里先短暂上锁更新状态并取出指针，再释放锁后 join。
+    Mp4Recorder *recorder = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pendingRecord_ = false;
+        recorder = mp4Recorder_.get();
+    }
+    if (recorder != nullptr) {
+        recorder->Stop(); // 触发 onFinished（在写线程上，锁已释放，不会死锁）
     }
     // 状态在 onFinished 里置 stopped，这里先不重复发
 }
 
 void MediaStreamEngine::Destroy() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pendingRecord_ = false;
-    statsRunning_ = false;
-    if (statsThread_.joinable()) {
-        statsThread_.join();
+    Mp4Recorder *recorder = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pendingRecord_ = false;
+        statsRunning_ = false;
+        if (statsThread_.joinable()) {
+            statsThread_.join();
+        }
+        if (rtmpClient_) {
+            rtmpClient_->Stop();
+            rtmpClient_.reset();
+        }
+        recorder = mp4Recorder_.get();
     }
-    if (rtmpClient_) {
-        rtmpClient_->Stop();
-        rtmpClient_.reset();
+    // 同样在锁外 join 写线程，避免 onFinished 重新加锁造成死锁
+    if (recorder != nullptr) {
+        recorder->Stop();
     }
-    if (mp4Recorder_) {
-        mp4Recorder_->Stop();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         mp4Recorder_.reset();
+        inited_ = false;
     }
-    StopCapturePipelineLocked();
-    inited_ = false;
+    // 采集/编码在锁外收尾（OH_*_Stop 在锁外执行）
+    TeardownPipelineUnlocked();
 }
 
 // —— 采集+编码管线 ——
@@ -409,33 +434,53 @@ bool MediaStreamEngine::EnsureCapturePipelineLocked(int &errCode, std::string &e
     return true;
 }
 
-void MediaStreamEngine::StopCapturePipelineLocked() {
-    if (capture_) {
-        capture_->Stop();
-        capture_.reset();
+void MediaStreamEngine::TeardownPipelineUnlocked() {
+    // 两段式收尾避免锁序反转死锁：
+    //  1) 锁内将采集/编码对象从引擎剥离并在引擎侧置空，回调线程（OnCapturedVideo 等）随即可见空指针安全退出；
+    //  2) 锁外再执行 OH_AVScreenCapture_StopScreenCapture / OH_*_Stop / Destroy。
+    // 若持引擎锁调用阻断式 Stop，而采集/编码回调线程又在回调里锁同一把 mutex_，
+    // 会让 Stop 等到回调线程返回、回调线程又等锁 → 死锁（表现为 APP THREAD_BLOCK 冻结）。
+    std::unique_ptr<ScreenCapture> cap;
+    std::unique_ptr<AudioEncoder> aen;
+    std::unique_ptr<VideoEncoder> ven;
+    std::unique_ptr<AudioMixer> mix;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cap = std::move(capture_);
+        aen = std::move(audioEncoder_);
+        ven = std::move(videoEncoder_);
+        mix = std::move(mixer_);
+        avcC_.clear();
+        asc_.clear();
+        mp4Started_ = false;
     }
-    if (audioEncoder_) {
-        audioEncoder_->Stop();
-        audioEncoder_.reset();
+    if (cap) {
+        cap->Stop();
     }
-    if (videoEncoder_) {
-        videoEncoder_->Stop();
-        videoEncoder_.reset();
+    if (aen) {
+        aen->Stop();
     }
-    if (mixer_) {
-        mixer_.reset();
+    if (ven) {
+        ven->Stop();
     }
-    avcC_.clear();
-    asc_.clear();
-    mp4Started_ = false;
+    // mix 无后台线程，随局部对象析构释放即可
 }
 
-void MediaStreamEngine::MaybeStopPipelineLocked() {
-    bool streaming =
-        streamState_ == "streaming" || streamState_ == "connecting" || streamState_ == "reconnecting";
-    bool recording = recordState_ == "recording";
-    if (!streaming && !recording) {
-        StopCapturePipelineLocked();
+void MediaStreamEngine::MaybeStopPipelineUnlocked() {
+    bool teardown = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool streaming = streamState_ == "streaming" || streamState_ == "connecting" ||
+                         streamState_ == "reconnecting";
+        bool recording = recordState_ == "recording";
+        teardown = !streaming && !recording;
+    }
+    if (!teardown) {
+        return;
+    }
+    TeardownPipelineUnlocked();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (captureState_ != "idle") {
             captureState_ = "idle";
             EmitCaptureState("idle");
@@ -448,12 +493,17 @@ void MediaStreamEngine::MaybeStopPipelineLocked() {
 
 void MediaStreamEngine::OnCapturedVideo(const uint8_t *data, int width, int height, bool isNv12,
                                         int64_t ptsNs) {
+    // 采集回调与管线收尾可能并发（收尾会清空 videoEncoder_），此处统一加锁读取并判空，
+    // 避免悬垂指针；RGBA 暂存缓冲也在同锁内访问。
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (videoEncoder_ == nullptr) {
+        return;
+    }
     int64_t ptsUs = ptsNs / 1000;
     if (isNv12) {
         videoEncoder_->InputFrame(data, ptsUs);
     } else {
         // RGBA 兜底：软件转 NV12 进编码器
-        std::lock_guard<std::mutex> lock(mutex_);
         size_t need = static_cast<size_t>(width) * height * 3 / 2;
         if (rgbaToNv12Scratch_.size() < need) {
             rgbaToNv12Scratch_.resize(need);
@@ -560,17 +610,21 @@ void MediaStreamEngine::OnAscReady(const std::vector<uint8_t> &asc) {
 }
 
 void MediaStreamEngine::TryStartPendingRecordLocked() {
-    if (!pendingRecord_ || mp4Started_ || avcC_.empty() || asc_.empty()) {
+    // 仅需视频 avcC 到位即可启动（音频可选，静音画面正常落盘）
+    if (!pendingRecord_ || mp4Started_ || avcC_.empty()) {
         return;
     }
     mp4Recorder_ = std::make_unique<Mp4Recorder>();
     Mp4Recorder::Callbacks mcb;
     mcb.onFinished = [this](const Mp4Recorder::Result &result) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        recordState_ = "stopped";
-        EmitRecordState("stopped");
-        EmitRecordFinishedEvent(result);
-        MaybeStopPipelineLocked();
+        // 锁外收尾管线，避免写线程持锁调用阻断式 Stop 与回调加锁死锁
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            recordState_ = "stopped";
+            EmitRecordState("stopped");
+            EmitRecordFinishedEvent(result);
+        }
+        MaybeStopPipelineUnlocked();
     };
     mcb.onError = [this](int code, const std::string &message) {
         std::lock_guard<std::mutex> lk(mutex_);

@@ -44,7 +44,7 @@ public:
     Mp4Recorder() = default;
     ~Mp4Recorder();
 
-    // 启动录制；avcC/asc 必须已就绪（引擎在两者齐备后才调用 Start）
+    // 启动录制；avcC 就绪即可（asc 可选：无系统音频时仅视频轨，静音画面也能落盘）
     bool Start(const std::string &dirPath, int width, int height, const std::vector<uint8_t> &avcC,
                const std::vector<uint8_t> &asc, Callbacks callbacks);
 
@@ -83,8 +83,11 @@ private:
 
     std::string fileName_;
     std::string filePath_;
+    // 首/末采样 pts（μs）仅用于 mp4 采样缓冲的相对 pts 归零
     std::atomic<int64_t> firstPtsUs_{-1};
     std::atomic<int64_t> lastPtsUs_{0};
+    // 录制时长按真实墙钟计算（设备编码器 pts 绝对时钟不可靠，不能用 (last-first)/1000）
+    std::atomic<int64_t> startSteadyMs_{0};
     std::atomic<int64_t> writtenBytes_{0};
     std::atomic<bool> finished_{false};
 

@@ -176,6 +176,34 @@ napi_value NapiDestroy(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// 把 ErrorCode 枚举注册为模块导出对象（与 Index.d.ts 的 `export enum ErrorCode` 对齐）
+// 关键:ArkTS `import { ErrorCode } from 'media_stream'` 解析的是名为 "ErrorCode" 的导出符号，
+// 因此必须新建一个枚举对象赋给 exports.ErrorCode，而不是把成员散落成顶层导出（否则运行时
+// 仍报 "does not provide an export name 'ErrorCode'"）。
+void RegisterErrorCodeExport(napi_env env, napi_value exports) {
+    napi_value ec = nullptr;
+    napi_create_object(env, &ec);
+    auto set = [&](const char *name, int32_t val) {
+        napi_value v = nullptr;
+        napi_create_int32(env, val, &v);
+        napi_set_named_property(env, ec, name, v);
+    };
+    set("INVALID_ARG", static_cast<int32_t>(EngineError::kInvalidArg));
+    set("BUSY", static_cast<int32_t>(EngineError::kBusy));
+    set("CAPTURE_INIT_FAIL", static_cast<int32_t>(EngineError::kCaptureInitFail));
+    set("CAPTURE_PERMISSION_DENIED", static_cast<int32_t>(EngineError::kCapturePermissionDenied));
+    set("MIC_PERMISSION_DENIED", static_cast<int32_t>(EngineError::kMicPermissionDenied));
+    set("ENCODER_INIT_FAIL", static_cast<int32_t>(EngineError::kEncoderInitFail));
+    set("ENCODER_ERROR", static_cast<int32_t>(EngineError::kEncoderError));
+    set("RTMP_URL_INVALID", static_cast<int32_t>(EngineError::kRtmpUrlInvalid));
+    set("RTMP_CONNECT_FAIL", static_cast<int32_t>(EngineError::kRtmpConnectFail));
+    set("RTMP_TIMEOUT", static_cast<int32_t>(EngineError::kRtmpTimeout));
+    set("RTMP_AUTH_FAIL", static_cast<int32_t>(EngineError::kRtmpAuthFail));
+    set("STORAGE_FULL", static_cast<int32_t>(EngineError::kStorageFull));
+    set("INTERNAL_ERROR", static_cast<int32_t>(EngineError::kInternalError));
+    napi_set_named_property(env, exports, "ErrorCode", ec);
+}
+
 napi_value InitModule(napi_env env, napi_value exports) {
     napi_property_descriptor methods[] = {
         {"init", nullptr, NapiInit, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -187,6 +215,8 @@ napi_value InitModule(napi_env env, napi_value exports) {
         {"destroy", nullptr, NapiDestroy, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(methods) / sizeof(methods[0]), methods);
+    // 额外导出 ErrorCode 枚举成员（无副作用：仅写入 exports 对象属性）
+    RegisterErrorCodeExport(env, exports);
     return exports;
 }
 

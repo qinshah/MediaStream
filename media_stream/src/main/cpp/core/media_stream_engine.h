@@ -72,8 +72,8 @@ private:
 
     // 采集+编码管线拉起/释放
     bool EnsureCapturePipelineLocked(int &errCode, std::string &errMsg);
-    void StopCapturePipelineLocked();
-    void MaybeStopPipelineLocked(); // 两输出均停 → 释放采集编码
+    void TeardownPipelineUnlocked(); // 锁内剥离指针、锁外执行 OH_*_Stop（避免回调加锁死锁）
+    void MaybeStopPipelineUnlocked(); // 两输出均停 → 释放采集编码（须在未持有互斥量时调用）
 
     // 采集回调挂接
     void OnCapturedVideo(const uint8_t *data, int width, int height, bool isNv12, int64_t ptsNs);

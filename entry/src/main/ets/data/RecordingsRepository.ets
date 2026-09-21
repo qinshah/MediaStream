@@ -51,6 +51,25 @@ export class RecordingsRepository {
 
   // 录制完成事件入列（去重按 filePath）并持久化索引
   add(meta: RecordingMeta): void {
+    // 若尚未经 refresh() 初始化目录（列表页可能未打开），从 filePath 反推 filesDir 与索引路径，
+    // 保证录制结束立刻能持久化，避免重启后被误判为孤儿而标"无效"
+    if (this.idxPath_.length === 0 && meta.filePath.length > 0) {
+      const idxn = meta.filePath.indexOf('/videos/');
+      if (idxn >= 0) {
+        this.filesDir_ = meta.filePath.substring(0, idxn);
+        this.idxPath_ = `${this.filesDir_}/${IDX_NAME}`;
+      }
+    }
+    // 内存 items_ 可能为空（应用重启后未打开列表页、先开始录制），
+    // 先把磁盘索引里尚未载入内存的历史记录合并进 items_，避免 persist 用 TRUNC 覆盖丢历史
+    if (this.idxPath_.length > 0 && this.items_.length === 0) {
+      const persisted = this.loadIndex();
+      persisted.forEach((v: RecordingItem, p: string) => {
+        if (this.items_.findIndex((it) => it.filePath === p) < 0) {
+          this.items_.push(v);
+        }
+      });
+    }
     const exists = this.items_.findIndex((it) => it.filePath === meta.filePath);
     const item = new RecordingItem(meta.fileName, meta.filePath, meta.durationMs, meta.sizeBytes, meta.createdAtMs);
     if (exists >= 0) {

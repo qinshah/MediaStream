@@ -45,6 +45,10 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     firstPtsUs_ = -1;
     lastPtsUs_ = 0;
     writtenBytes_ = 0;
+    // 录制起点（真实墙钟，用于时长统计）
+    startSteadyMs_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
 
     // 确保录制目录存在
     (void)mkdir(dirPath.c_str(), 0755);
@@ -107,28 +111,23 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
         return false;
     }
 
-    // 音频轨：AAC + 48000/2 + ASC
-    OH_AVFormat *afmt = OH_AVFormat_Create();
-    OH_AVFormat_SetStringValue(afmt, OH_MD_KEY_CODEC_MIME, OH_AVCODEC_MIMETYPE_AUDIO_AAC);
-    OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_AUD_SAMPLE_RATE, 48000);
-    OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_AUD_CHANNEL_COUNT, 2);
+    // 音频轨（可选）：系统内录音频在无播放时无 ASC，此时仅视频轨，静音录制也能正常落盘
+    audioTrack_ = -1;
     if (!asc_.empty()) {
+        OH_AVFormat *afmt = OH_AVFormat_Create();
+        OH_AVFormat_SetStringValue(afmt, OH_MD_KEY_CODEC_MIME, OH_AVCODEC_MIMETYPE_AUDIO_AAC);
+        OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_AUD_SAMPLE_RATE, 48000);
+        OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_AUD_CHANNEL_COUNT, 2);
         OH_AVFormat_SetBuffer(afmt, OH_MD_KEY_CODEC_CONFIG, asc_.data(), asc_.size());
-    }
-    rc = OH_AVMuxer_AddTrack(muxer_, &audioTrack_, afmt);
-    OH_AVFormat_Destroy(afmt);
-    if (rc != AV_ERR_OK || audioTrack_ < 0) {
-        MS_LOG_ERROR("AddTrack audio failed rc=%{public}d", rc);
-        OH_AVMuxer_Destroy(muxer_);
-        muxer_ = nullptr;
-        close(fd_);
-        fd_ = -1;
-        unlink(filePath_.c_str());
-        recording_ = false;
-        if (callbacks_.onError) {
-            callbacks_.onError(kErrInternal, "添加音频轨失败");
+        rc = OH_AVMuxer_AddTrack(muxer_, &audioTrack_, afmt);
+        OH_AVFormat_Destroy(afmt);
+        if (rc != AV_ERR_OK || audioTrack_ < 0) {
+            // 音频轨添加失败 → 降级为仅视频轨，不中断录制
+            audioTrack_ = -1;
+            MS_LOG_WARN("AddTrack audio failed rc=%{public}d, record video-only", rc);
         }
-        return false;
+    } else {
+        MS_LOG_INFO("no ASC (no system audio), record video-only");
     }
 
     rc = OH_AVMuxer_Start(muxer_);
@@ -167,6 +166,9 @@ void Mp4Recorder::WriteVideo(const uint8_t *data, int32_t size, int64_t ptsUs, b
 }
 
 void Mp4Recorder::WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
+    if (audioTrack_ < 0) {
+        return; // 无音频轨（系统内录无 ASC）
+    }
     if (!recording_.load() || stopRequested_.load() || data == nullptr || size <= 0) {
         return;
     }
@@ -181,12 +183,15 @@ void Mp4Recorder::WriteAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
 }
 
 int64_t Mp4Recorder::DurationMs() const {
-    int64_t first = firstPtsUs_.load();
-    int64_t last = lastPtsUs_.load();
-    if (first < 0 || last <= first) {
+    // 以真实墙钟计算录制时长（编码器绝对 pts 时钟不可靠，避免转换成极不合理的时长）
+    int64_t start = startSteadyMs_.load();
+    if (start <= 0) {
         return 0;
     }
-    return (last - first) / 1000;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+    return now - start;
 }
 
 void Mp4Recorder::Stop() {

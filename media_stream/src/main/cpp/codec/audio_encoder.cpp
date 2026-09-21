@@ -105,14 +105,18 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
 }
 
 void AudioEncoder::Stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (encoder_ != nullptr) {
-        if (running_) {
-            OH_AudioEncoder_Stop(encoder_);
-            running_ = false;
-        }
-        OH_AudioEncoder_Destroy(encoder_);
+    // 与视频编码器一致：勿持 mutex_ 调用 OH_AudioEncoder_Stop/Destroy，避免与
+    // 编码器工作线程（OnNeedInputData 锁本 mutex_）形成锁序反转死锁。
+    OH_AVCodec *enc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        enc = encoder_;
         encoder_ = nullptr;
+        running_ = false;
+    }
+    if (enc != nullptr) {
+        OH_AudioEncoder_Stop(enc);
+        OH_AudioEncoder_Destroy(enc);
         MS_LOG_INFO("AudioEncoder stopped");
     }
 }

@@ -56,7 +56,9 @@ bool VideoEncoder::Start(int width, int height, int fps, int bitrateKbps, Callba
         return false;
     }
 
-    OH_AVCodecCallback cb = {OnCodecError, OnStreamChanged, OnNeedOutputBuffer};
+    // OH_AVCodecCallback 四个字段必须显式给定，否则缺省为 nullptr 导致 RegisterCallback 失败(rc=3, onNewOutputBuffer is nullptr)。
+    // 输入采用 QueryInputBuffer 拉取式主动投递，onNeedInputBuffer 只需空实现占位。
+    OH_AVCodecCallback cb = {OnCodecError, OnStreamChanged, OnNeedInputBuffer, OnNeedOutputBuffer};
     rc = OH_VideoEncoder_RegisterCallback(encoder_, cb, this);
     if (rc != AV_ERR_OK) {
         MS_LOG_ERROR("OH_VideoEncoder_RegisterCallback failed rc=%{public}d", rc);
@@ -86,45 +88,39 @@ bool VideoEncoder::Start(int width, int height, int fps, int bitrateKbps, Callba
 }
 
 void VideoEncoder::InputFrame(const uint8_t *nv12, int64_t ptsUs) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_ || encoder_ == nullptr || nv12 == nullptr) {
+    if (nv12 == nullptr) {
         return;
     }
-    // 查询可用输入缓冲（非阻塞，0 超时——无空闲缓冲则丢帧，不背压采集）
-    uint32_t index = 0;
-    int32_t rc = OH_VideoEncoder_QueryInputBuffer(encoder_, &index, 0);
-    if (rc != AV_ERR_OK) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_ || encoder_ == nullptr) {
+            return;
+        }
+        int32_t need = width_ * height_ * 3 / 2;
+        // 队列有界：队满丢最旧一帧（不背压采集）
+        if (pendingFrames_.size() >= kMaxPendingFrames) {
+            pendingFrames_.pop_front();
+            pendingPtsUs_.pop_front();
+        }
+        pendingFrames_.emplace_back(nv12, nv12 + need);
+        pendingPtsUs_.push_back(ptsUs);
     }
-    OH_AVBuffer *buffer = OH_VideoEncoder_GetInputBuffer(encoder_, index);
-    if (buffer == nullptr) {
-        return;
-    }
-    uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
-    int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
-    int32_t need = width_ * height_ * 3 / 2;
-    if (addr == nullptr || capacity < need) {
-        return;
-    }
-    memcpy(addr, nv12, need);
-    OH_AVCodecBufferAttr attr = {};
-    attr.pts = ptsUs;
-    attr.size = need;
-    attr.offset = 0;
-    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-    OH_AVBuffer_SetBufferAttr(buffer, &attr);
-    OH_VideoEncoder_PushInputBuffer(encoder_, index);
 }
 
 void VideoEncoder::Stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (encoder_ != nullptr) {
-        if (running_) {
-            OH_VideoEncoder_Stop(encoder_);
-            running_ = false;
-        }
-        OH_VideoEncoder_Destroy(encoder_);
+    // 勿在持有 mutex_ 时调用 OH_VideoEncoder_Stop/Destroy：编码器工作线程（OnNeedInputBuffer
+    // 等）也会锁本 mutex_，若 Stop 等待该工作线程返回，会形成锁序反转死锁。
+    // 因此在锁内仅置空指针并摘除运行标志，真正的 OH 停止/销毁放到锁外执行。
+    OH_AVCodec *enc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        enc = encoder_;
         encoder_ = nullptr;
+        running_ = false;
+    }
+    if (enc != nullptr) {
+        OH_VideoEncoder_Stop(enc);
+        OH_VideoEncoder_Destroy(enc);
         MS_LOG_INFO("VideoEncoder stopped");
     }
 }
@@ -137,6 +133,66 @@ void VideoEncoder::OnCodecError(OH_AVCodec *codec, int32_t errorCode, void *user
     MS_LOG_ERROR("VideoEncoder error %{public}d", errorCode);
     if (self != nullptr && self->callbacks_.onError) {
         self->callbacks_.onError(errorCode);
+    }
+}
+
+// 输入缓冲回调：从待编码队列取出一帧 NV12，拷入编码器输入缓冲并 Push
+void VideoEncoder::OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer, void *userData) {
+    auto *self = static_cast<VideoEncoder *>(userData);
+    if (self == nullptr) {
+        return;
+    }
+    std::vector<uint8_t> frame;
+    int64_t ptsUs = 0;
+    bool hasFrame = false;
+    {
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        if (!self->running_ || self->encoder_ == nullptr) {
+            return;
+        }
+        if (!self->pendingFrames_.empty()) {
+            frame = std::move(self->pendingFrames_.front());
+            self->pendingFrames_.pop_front();
+            ptsUs = self->pendingPtsUs_.front();
+            self->pendingPtsUs_.pop_front();
+            hasFrame = true;
+        }
+    }
+    if (!hasFrame || buffer == nullptr) {
+        // 无待编码帧：仍 Push 一个 0 长度缓冲占位，避免编码器等待（与音频编码器行为一致）
+        OH_AVCodecBufferAttr empty = {};
+        empty.pts = 0;
+        empty.size = 0;
+        empty.flags = AVCODEC_BUFFER_FLAGS_NONE;
+        if (buffer != nullptr) {
+            OH_AVBuffer_SetBufferAttr(buffer, &empty);
+        }
+        OH_VideoEncoder_PushInputBuffer(codec, index);
+        return;
+    }
+    uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
+    int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
+    if (addr == nullptr || capacity < static_cast<int32_t>(frame.size())) {
+        OH_AVCodecBufferAttr empty = {};
+        empty.pts = 0;
+        empty.size = 0;
+        empty.flags = AVCODEC_BUFFER_FLAGS_NONE;
+        OH_AVBuffer_SetBufferAttr(buffer, &empty);
+        OH_VideoEncoder_PushInputBuffer(codec, index);
+        return;
+    }
+    memcpy(addr, frame.data(), frame.size());
+    OH_AVCodecBufferAttr attr = {};
+    attr.pts = ptsUs;
+    attr.size = static_cast<int32_t>(frame.size());
+    attr.offset = 0;
+    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+    OH_AVBuffer_SetBufferAttr(buffer, &attr);
+    OH_VideoEncoder_PushInputBuffer(codec, index);
+    if (self->pushedCnt_ < 3) {
+        self->pushedCnt_++;
+        MS_LOG_INFO("pushed input frame #%{public}d via callback (index=%{public}u size=%{public}zu)", self->pushedCnt_,
+                    index, frame.size());
     }
 }
 
