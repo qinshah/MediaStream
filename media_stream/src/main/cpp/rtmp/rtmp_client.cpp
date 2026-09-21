@@ -128,20 +128,41 @@ void RtmpClient::Stop() {
     MS_LOG_INFO("RtmpClient stopped");
 }
 
+// 配置就绪（可能晚于 publish 成功，因为采集要等用户授权）→ 立即补发 sequence header/metadata
+void RtmpClient::ConfigMaybeEnqueue() {
+    State st = state_.load();
+    if (st == State::kStreaming || st == State::kReconnecting) {
+        EnqueueConfigMessages();
+    }
+}
+
 void RtmpClient::SetVideoConfig(const std::vector<uint8_t> &avcC) {
-    std::lock_guard<std::mutex> lock(configMutex_);
-    avcC_ = avcC;
+    {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        avcC_ = avcC;
+    }
+    ConfigMaybeEnqueue();
 }
 
 void RtmpClient::SetAudioConfig(const std::vector<uint8_t> &asc) {
-    std::lock_guard<std::mutex> lock(configMutex_);
-    asc_ = asc;
+    {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        // 已有真实 ASC 时不接受再被兜底值覆盖
+        if (!asc_.empty() && asc.size() != asc_.size()) {
+            return;
+        }
+        asc_ = asc;
+    }
+    ConfigMaybeEnqueue();
 }
 
 void RtmpClient::SetMetaData(int width, int height, int fps, int videoBitrateKbps) {
-    std::lock_guard<std::mutex> lock(configMutex_);
-    metaData_ = FlvPackager::BuildMetaData(width, height, fps, videoBitrateKbps);
-    hasMeta_ = true;
+    {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        metaData_ = FlvPackager::BuildMetaData(width, height, fps, videoBitrateKbps);
+        hasMeta_ = true;
+    }
+    ConfigMaybeEnqueue();
 }
 
 int64_t RtmpClient::PtsUsToMs(int64_t ptsUs) {
@@ -158,6 +179,11 @@ void RtmpClient::SendVideo(const uint8_t *data, int32_t size, int64_t ptsUs, boo
     if (state_.load() != State::kStreaming && state_.load() != State::kReconnecting) {
         return;
     }
+    if (!sentVideoSeqHdr_.load()) {
+        // avcC 尚未产出或 sequence header 尚未排到发送队列：先丢帧，保证播放器先拿到 seq header
+        droppedVideoFrames_++;
+        return;
+    }
     OutMessage msg;
     msg.payload = FlvPackager::BuildVideoTag(data, size, isKeyframe);
     msg.timestampMs = static_cast<uint32_t>(PtsUsToMs(ptsUs));
@@ -171,6 +197,10 @@ void RtmpClient::SendVideo(const uint8_t *data, int32_t size, int64_t ptsUs, boo
 
 void RtmpClient::SendAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
     if (state_.load() != State::kStreaming && state_.load() != State::kReconnecting) {
+        return;
+    }
+    if (!sentAudioSeqHdr_.load()) {
+        // AAC sequence header（ASC）尚未发送：先丢帧，避免播放器拿到无 ASC 的裸 AAC
         return;
     }
     OutMessage msg;
@@ -230,12 +260,15 @@ bool RtmpClient::RunSession() {
     streamId_ = 0;
     txnCounter_ = 1;
     inChunkSize_ = 128;
+    sentMeta_.store(false);
+    sentVideoSeqHdr_.store(false);
+    sentAudioSeqHdr_.store(false);
     for (auto &c : chunkIn_) {
         c = ChunkIn();
     }
 
-    if (!ConnectSocket() || !Handshake() || !SendConnectCommand() || !SendCreateStreamCommand() ||
-        !SendPublishCommand()) {
+    if (!ConnectSocket() || !Handshake() || !SendSetChunkSize() || !SendConnectCommand() ||
+        !SendCreateStreamCommand() || !SendPublishCommand()) {
         if (socketFd_ >= 0) {
             close(socketFd_);
             socketFd_ = -1;
@@ -279,9 +312,11 @@ bool RtmpClient::RunSession() {
         } else if (videoQueue_ && videoQueue_->Size() > 0) {
             hasMsg = videoQueue_->Pop(msg);
         }
-        if (hasMsg && !SendMessage(msg)) {
-            MS_LOG_WARN("socket send failed");
-            break;
+        if (hasMsg) {
+            if (!SendMessage(msg)) {
+                MS_LOG_WARN("socket send failed");
+                break;
+            }
         }
     }
 
@@ -480,6 +515,65 @@ void RtmpClient::WriteCommandMessage(OutMessage &msg, const std::vector<uint8_t>
     msg.chunkStreamId = 3;
 }
 
+// —— 命令等待与响应接收 ——
+// 单线程模型下服务端响应只能通过 RecvMessage() 落地。此前"发完命令就阻塞等条件变量"，
+// 等待期间无人读 socket，_result/onStatus 永远解析不到 → 固定 5s 超时后断连重连。
+// 因此等待响应必须同时 select 轮询并解析入站消息。
+bool RtmpClient::WaitWithRecv(const std::function<bool()> &done, int timeoutMs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(cmdMutex_);
+            if (done()) {
+                return true;
+            }
+            if (sessionDead_) {
+                return false;
+            }
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        fd_set readFds;
+        FD_ZERO(&readFds);
+        FD_SET(socketFd_, &readFds);
+        struct timeval tv = {0, 5000}; // 5ms 轮询粒度
+        int sel = select(socketFd_ + 1, &readFds, nullptr, nullptr, &tv);
+        if (sel < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            MS_LOG_WARN("rtmp wait select err %{public}d", errno);
+            return false;
+        }
+        if (sel > 0 && FD_ISSET(socketFd_, &readFds)) {
+            if (!RecvMessage()) {
+                MS_LOG_WARN("rtmp recv failed while awaiting response");
+                std::lock_guard<std::mutex> lk(cmdMutex_);
+                sessionDead_ = true;
+                cmdCv_.notify_all();
+                return false;
+            }
+        }
+    }
+}
+
+bool RtmpClient::SendSetChunkSize() {
+    // 必须显式协商出站 chunk 大小：协议默认 128 字节，而 connect 命令与音视频帧远超此值。
+    // 不发送则服务端仍按 128 解析我们的大消息 → 报文错位。
+    OutMessage msg;
+    msg.payload.resize(4);
+    msg.payload[0] = static_cast<uint8_t>((outChunkSize_ >> 24) & 0xFF);
+    msg.payload[1] = static_cast<uint8_t>((outChunkSize_ >> 16) & 0xFF);
+    msg.payload[2] = static_cast<uint8_t>((outChunkSize_ >> 8) & 0xFF);
+    msg.payload[3] = static_cast<uint8_t>(outChunkSize_ & 0xFF);
+    msg.timestampMs = 0;
+    msg.typeId = kMsgSetChunkSize;
+    msg.msgStreamId = 0;
+    msg.chunkStreamId = 2;
+    return SendMessage(msg);
+}
+
 bool RtmpClient::SendConnectCommand() {
     AmfWriter w;
     w.WriteString("connect");
@@ -499,12 +593,9 @@ bool RtmpClient::SendConnectCommand() {
     if (!SendMessage(msg)) {
         return false;
     }
-    // 等 _result
-    std::unique_lock<std::mutex> lock(cmdMutex_);
+    // 等 _result：必须边读 socket 边等
     int myTxn = txnCounter_ - 1;
-    bool ok = cmdCv_.wait_for(lock, std::chrono::milliseconds(kConnectTimeoutMs),
-                              [&] { return pendingTxnResult_ == myTxn || sessionDead_; });
-    return ok && !sessionDead_;
+    return WaitWithRecv([&] { return pendingTxnResult_ == myTxn; }, kConnectTimeoutMs);
 }
 
 bool RtmpClient::SendCreateStreamCommand() {
@@ -517,11 +608,9 @@ bool RtmpClient::SendCreateStreamCommand() {
     if (!SendMessage(msg)) {
         return false;
     }
-    std::unique_lock<std::mutex> lock(cmdMutex_);
     int myTxn = txnCounter_ - 1;
-    bool ok = cmdCv_.wait_for(lock, std::chrono::milliseconds(kConnectTimeoutMs),
-                              [&] { return pendingTxnResult_ == myTxn || sessionDead_; });
-    return ok && !sessionDead_ && streamId_ != 0;
+    return WaitWithRecv([&] { return pendingTxnResult_ == myTxn && streamId_ != 0; },
+                        kConnectTimeoutMs);
 }
 
 bool RtmpClient::SendPublishCommand() {
@@ -538,11 +627,8 @@ bool RtmpClient::SendPublishCommand() {
     if (!SendMessage(msg)) {
         return false;
     }
-    // 等 onStatus(NetStream.Publish.Start)
-    std::unique_lock<std::mutex> lock(cmdMutex_);
-    bool ok = cmdCv_.wait_for(lock, std::chrono::milliseconds(kConnectTimeoutMs),
-                              [&] { return publishStarted_ || sessionDead_; });
-    return ok && !sessionDead_;
+    // 等 onStatus(NetStream.Publish.Start)：同样要边读 socket 边等
+    return WaitWithRecv([&] { return publishStarted_; }, kConnectTimeoutMs);
 }
 
 // —— 接收解析 ——
@@ -671,7 +757,7 @@ bool RtmpClient::HandleCommandMessage(const uint8_t *data, size_t size) {
         std::string info;
         double d = 0;
         if (reader.ReadValue(info, d) == 0x03) {
-            // info 对象扁平解析后最后一个字符串值（level/code 之一）
+            MS_LOG_INFO("rtmp onStatus info=%{public}s", info.c_str());
             if (info.find("NetStream.Publish.Start") != std::string::npos) {
                 std::lock_guard<std::mutex> lock(cmdMutex_);
                 publishStarted_ = true;
@@ -690,32 +776,47 @@ bool RtmpClient::HandleCommandMessage(const uint8_t *data, size_t size) {
 }
 
 void RtmpClient::EnqueueConfigMessages() {
-    std::lock_guard<std::mutex> lock(configMutex_);
-    if (hasMeta_ && !metaData_.empty()) {
-        OutMessage msg;
-        msg.payload = metaData_;
-        msg.timestampMs = 0;
-        msg.typeId = kMsgDataAmf0;
-        msg.msgStreamId = streamId_;
-        msg.chunkStreamId = 5;
-        controlQueue_->Push(std::move(msg));
+    if (!controlQueue_) {
+        return;
     }
-    if (!avcC_.empty()) {
-        OutMessage msg;
-        msg.payload = FlvPackager::BuildVideoSequenceHeader(avcC_);
-        msg.timestampMs = 0;
-        msg.typeId = kMsgVideo;
-        msg.msgStreamId = streamId_;
-        msg.chunkStreamId = 6;
-        controlQueue_->Push(std::move(msg));
+    std::vector<OutMessage> pending;
+    {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        if (hasMeta_ && !metaData_.empty() && !sentMeta_.load()) {
+            OutMessage msg;
+            msg.payload = metaData_;
+            msg.timestampMs = 0;
+            msg.typeId = kMsgDataAmf0;
+            msg.msgStreamId = streamId_;
+            msg.chunkStreamId = 5;
+            pending.push_back(std::move(msg));
+            sentMeta_.store(true);
+        }
+        if (!avcC_.empty() && !sentVideoSeqHdr_.load()) {
+            OutMessage msg;
+            msg.payload = FlvPackager::BuildVideoSequenceHeader(avcC_);
+            msg.timestampMs = 0;
+            msg.typeId = kMsgVideo;
+            msg.msgStreamId = streamId_;
+            msg.chunkStreamId = 6;
+            pending.push_back(std::move(msg));
+            sentVideoSeqHdr_.store(true);
+            MS_LOG_INFO("rtmp video sequence header queued (%{public}zu bytes)", avcC_.size());
+        }
+        if (!asc_.empty() && !sentAudioSeqHdr_.load()) {
+            OutMessage msg;
+            msg.payload = FlvPackager::BuildAudioSequenceHeader(asc_);
+            msg.timestampMs = 0;
+            msg.typeId = kMsgAudio;
+            msg.msgStreamId = streamId_;
+            msg.chunkStreamId = 4;
+            pending.push_back(std::move(msg));
+            sentAudioSeqHdr_.store(true);
+            MS_LOG_INFO("rtmp audio sequence header queued (%{public}zu bytes)", asc_.size());
+        }
     }
-    if (!asc_.empty()) {
-        OutMessage msg;
-        msg.payload = FlvPackager::BuildAudioSequenceHeader(asc_);
-        msg.timestampMs = 0;
-        msg.typeId = kMsgAudio;
-        msg.msgStreamId = streamId_;
-        msg.chunkStreamId = 4;
+    // 控制消息优先发送：必须在媒体帧之前入队
+    for (auto &msg : pending) {
         controlQueue_->Push(std::move(msg));
     }
 }

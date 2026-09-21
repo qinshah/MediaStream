@@ -86,11 +86,15 @@ private:
     static bool ParseUrl(const std::string &url, RtmpUrl &out);
     void WriteCommandMessage(OutMessage &msg, const std::vector<uint8_t> &amfPayload);
 
+    // 等待服务端响应期间兼收 socket 消息（单线程 select 轮询；发完命令干等会必然超时）
+    bool WaitWithRecv(const std::function<bool()> &done, int timeoutMs);
+
     void ThreadMain();
     // 单轮连接生命周期：连接→握手→命令序列→推流循环；返回 false 表示连接断开（可重连）
     bool RunSession();
     bool ConnectSocket();
     bool Handshake();
+    bool SendSetChunkSize(); // 协商出站 chunk 大小（协议默认 128 不足以承载命令/视频帧）
     bool SendConnectCommand();
     bool SendCreateStreamCommand();
     bool SendPublishCommand();
@@ -109,6 +113,7 @@ private:
     void SetState(State state, int reconnectAttempt = 0);
     void FailSession(int errorCode, const std::string &message);
     void EnqueueConfigMessages(); // （重）连成功且 publish 后发送 metadata + sequence header
+    void ConfigMaybeEnqueue();    // 配置晚于 publish 就绪时补发（只发一次）
 
     int socketFd_ = -1;
     std::thread thread_;
@@ -131,7 +136,11 @@ private:
     std::vector<uint8_t> asc_;
     std::vector<uint8_t> metaData_;
     bool hasMeta_ = false;
-
+    // 配置消息发送去重：publish 成功时编码配置往往尚未就绪（采集要等用户授权），
+    // 因此改为「就绪即补发 + 只发一次」，并保证 sequence header 先于媒体帧。
+    std::atomic<bool> sentMeta_{false};
+    std::atomic<bool> sentVideoSeqHdr_{false};
+    std::atomic<bool> sentAudioSeqHdr_{false};
     std::atomic<int64_t> sentBytes_{0};
     std::atomic<int64_t> droppedVideoFrames_{0};
     std::atomic<int64_t> basePtsUs_{-1}; // 会话 epoch（首帧 pts）

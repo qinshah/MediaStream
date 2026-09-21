@@ -158,7 +158,12 @@ int AmfReader::ReadValue(std::string &outStr, double &outNum) {
                     return -1;
                 }
                 if (t == kAmfString) {
-                    outStr = v;
+                    // 累积全部字符串值：服务端 info 对象按 {level, code, description} 排列，
+                    // 只保留最后一个会让 description 覆盖 code，导致 NetStream.Publish.Start 匹配不到
+                    if (!outStr.empty()) {
+                        outStr += ';';
+                    }
+                    outStr += v;
                 }
             }
             return type;
