@@ -66,6 +66,9 @@ private:
     void MaybeRequestKeyFrame(OH_AVCodec *enc);
     // 从 Annex-B NALU 流提取 SPS/PPS 并构建 avcC
     void ExtractAvcc(const uint8_t *data, int32_t size);
+    // 去重发布 avcC（「仅发布一次」）。cfgMutex_ 只覆盖发布状态，回调 onCodecConfig
+    // （→引擎 OnAvccReady）在锁外执行，避免把引擎锁纳入本侧锁的嵌套范围。
+    void PublishAvcc(const std::vector<uint8_t> &record);
 
     OH_AVCodec *encoder_ = nullptr;
     Callbacks callbacks_;
@@ -82,6 +85,10 @@ private:
     int height_ = 0;
     bool avccEmitted_ = false;
     std::vector<uint8_t> avcc_;
+    // 保护 avcC 的发布状态。解析入口有两个、分别跑在编码器不同回调线程
+    // （onStreamChanged 与 onNeedOutputBuffer），并发写 avcc_ 属 UB。
+    // 锁序：mutex_(编码器锁) → cfgMutex_，不存在反向获取。
+    std::mutex cfgMutex_;
     std::vector<uint8_t> convertScratch_; // Annex-B→AVCC 转换暂存
     // 将 pendingFrames_ 队首帧写入指定输入槽并 SetBufferAttr（须持 mutex_）。
     // 成功返回 true 并弹出该帧；槽容量不足返回 false（该帧保留，槽转为暂留）。

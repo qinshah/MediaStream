@@ -47,8 +47,12 @@ bool VideoEncoder::Start(int width, int height, int fps, int bitrateKbps, Callba
     callbacks_ = std::move(callbacks);
     width_ = width;
     height_ = height;
-    avccEmitted_ = false;
-    avcc_.clear();
+    {
+        // 发布状态与 PublishAvcc 共用 cfgMutex_（锁序：mutex_ → cfgMutex_，无反向）
+        std::lock_guard<std::mutex> cfgLock(cfgMutex_);
+        avccEmitted_ = false;
+        avcc_.clear();
+    }
 
     encoder_ = OH_VideoEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_VIDEO_AVC);
     if (encoder_ == nullptr) {
@@ -329,11 +333,7 @@ void VideoEncoder::OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *fmt, void *us
         if (isAnnexB) {
             self->ExtractAvcc(config, configSize);
         } else {
-            self->avcc_.assign(config, config + configSize);
-            self->avccEmitted_ = true;
-            if (self->callbacks_.onCodecConfig) {
-                self->callbacks_.onCodecConfig(self->avcc_);
-            }
+            self->PublishAvcc(std::vector<uint8_t>(config, config + configSize));
         }
         MS_LOG_INFO("avcC from output description, %{public}zu bytes", configSize);
     }
@@ -358,6 +358,9 @@ void VideoEncoder::OnNeedOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBu
     int64_t ptsUs = 0;
     bool isKey = false;
     bool dispatch = false;
+    // avcC（SPS/PPS）解析所需的数据：锁内拷贝、锁外解析并回调。原因见下方 dispatch 处说明。
+    std::vector<uint8_t> cfgScratch;
+    bool needCfg = false;
     {
         std::lock_guard<std::mutex> lock(self->mutex_);
         if (self->encoder_ == nullptr || !self->running_) {
@@ -381,34 +384,45 @@ void VideoEncoder::OnNeedOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBu
             // 并非标准 AVCC record。若直接当作 OH_MD_KEY_CODEC_CONFIG 传给封装器，会写出
             // 缺少 SPS/PPS 的 avcC，导致任何解码器都无法初始化（黑屏/绿屏/无法播放）。
             // 因此这里用 ExtractAvcc 从该 Annex-B 里正规提取 SPS/PPS 并构造标准 avcC。
+            // 注意：ExtractAvcc 会回调 onCodecConfig（→引擎 OnAvccReady，取引擎 mutex_），
+            // 绝不能在持本 mutex_ 时执行（否则与采集线程「持引擎锁 → InputFrame 取本锁」
+            // 形成环形等待）。故此处仅拷贝，解析放到锁外。
             if (!self->avccEmitted_ && size > 0) {
-                self->ExtractAvcc(data, size); // 内部成功时会设置 avccEmitted_ 并回调 onCodecConfig
+                cfgScratch.assign(data, data + size);
+                needCfg = true;
             }
             OH_VideoEncoder_FreeOutputBuffer(codec, index);
-            return;
-        }
+        } else {
+            isKey = (attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0;
+            ptsUs = attr.pts;
 
-        isKey = (attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0;
-        ptsUs = attr.pts;
-
-        // Annex-B → AVCC（编码器输出为 Annex-B 时转换；已是 AVCC 则透传）
-        const uint8_t *finalData = data;
-        int32_t finalSize = size;
-        if (size >= 4 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (data[2] == 0 && data[3] == 1))) {
-            if (!self->avccEmitted_) {
-                self->ExtractAvcc(data, size);
+            // Annex-B → AVCC（编码器输出为 Annex-B 时转换；已是 AVCC 则透传）
+            const uint8_t *finalData = data;
+            int32_t finalSize = size;
+            if (size >= 4 && data[0] == 0 && data[1] == 0 &&
+                (data[2] == 1 || (data[2] == 0 && data[3] == 1))) {
+                if (!self->avccEmitted_) {
+                    cfgScratch.assign(data, data + size); // 同样延后到锁外解析
+                    needCfg = true;
+                }
+                if (self->ConvertAnnexBToAvcc(data, size, self->convertScratch_)) {
+                    finalData = self->convertScratch_.data();
+                    finalSize = static_cast<int32_t>(self->convertScratch_.size());
+                }
             }
-            if (self->ConvertAnnexBToAvcc(data, size, self->convertScratch_)) {
-                finalData = self->convertScratch_.data();
-                finalSize = static_cast<int32_t>(self->convertScratch_.size());
-            }
-        }
 
-        // 锁内先拷贝最终样本（样本通常很小；拷贝后可释放输出缓冲并放开编码器锁，
-        // 避免跨锁引用 convertScratch_/OH_AVBuffer 的悬垂），随后在锁外安全分发到引擎。
-        out.assign(finalData, finalData + finalSize);
-        OH_VideoEncoder_FreeOutputBuffer(codec, index);
-        dispatch = true;
+            // 锁内先拷贝最终样本（样本通常很小；拷贝后可释放输出缓冲并放开编码器锁，
+            // 避免跨锁引用 convertScratch_/OH_AVBuffer 的悬垂），随后在锁外安全分发到引擎。
+            out.assign(finalData, finalData + finalSize);
+            OH_VideoEncoder_FreeOutputBuffer(codec, index);
+            dispatch = true;
+        }
+    }
+    // 锁外解析 avcC 并回调 onCodecConfig（OnAvccReady 会取引擎 mutex_）。
+    // 锁序约定：任何线程都只能是「引擎锁 → 编码器锁」，绝不能反向；本函数在编码器输出
+    // 回调线程上运行，若持本锁回调引擎就会与采集线程形成环形等待 → 主线程 APP_FREEZE。
+    if (needCfg) {
+        self->ExtractAvcc(cfgScratch.data(), static_cast<int32_t>(cfgScratch.size()));
     }
     // 锁外分发到引擎（OnEncodedVideo 取引擎 mutex_ 不再与本编码器 mutex_ 相交，死锁解除）
     if (dispatch && self->callbacks_.onOutput) {
@@ -505,13 +519,28 @@ void VideoEncoder::ExtractAvcc(const uint8_t *data, int32_t size) {
     avcc.push_back(static_cast<uint8_t>(pps.size() & 0xFF));
     avcc.insert(avcc.end(), pps.begin(), pps.end());
 
-    avcc_ = std::move(avcc);
-    avccEmitted_ = true;
-    DumpHex("avcC extractAvcc", avcc_.data(), avcc_.size());
-    if (callbacks_.onCodecConfig) {
-        callbacks_.onCodecConfig(avcc_);
+    PublishAvcc(avcc);
+}
+
+void VideoEncoder::PublishAvcc(const std::vector<uint8_t> &record) {
+    if (record.empty()) {
+        return;
     }
-    MS_LOG_INFO("avcC extracted from Annex-B, %{public}zu bytes", avcc_.size());
+    {
+        std::lock_guard<std::mutex> lock(cfgMutex_);
+        if (avccEmitted_) {
+            return; // 已发布过：avcC 每场会话只需发一次
+        }
+        avcc_ = record;
+        avccEmitted_ = true;
+    }
+    // 回调在锁外：onCodecConfig → 引擎 OnAvccReady 会取引擎 mutex_。
+    // 本侧不再持有任何锁，故可与「持引擎锁 → InputFrame 取编码器锁」的采集线程安全并发。
+    DumpHex("avcC publish", record.data(), record.size());
+    if (callbacks_.onCodecConfig) {
+        callbacks_.onCodecConfig(record);
+    }
+    MS_LOG_INFO("avcC published, %{public}zu bytes", record.size());
 }
 
 } // namespace media_stream
