@@ -21,6 +21,10 @@ import { errorMessage } from '../model/Types';
 const DOMAIN = 0x0000;
 const TAG = 'ConsoleViewModel';
 
+// 默认推流地址：指向 Mac 上 node-media-server 起的局域网 RTMP 服务（rtmp://<mac-ip>:1935/live/stream）。
+// 便于“打开即点推流”完成闭环测试；用户仍可在输入框改成任意地址，改后持久化覆盖默认值。
+const DEFAULT_RTMP_URL = 'rtmp://192.168.43.10/live/stream';
+
 // 事件监听器：把原生/服务的状态事件镜像进 viewmodel 的可观测字段
 class ConsoleListener implements MediaStreamEventListener {
   private owner: ConsoleViewModel;
@@ -61,7 +65,7 @@ class ConsoleListener implements MediaStreamEventListener {
 @ObservedV2
 export class ConsoleViewModel {
   // —— 配置（可编辑，变更即持久化；会话进行中锁定）——
-  @Trace rtmpUrl: string = '';
+  @Trace rtmpUrl: string = DEFAULT_RTMP_URL;
   @Trace preset: string = '720p';
   @Trace fps: number = 30;
   @Trace videoBitrateKbps: number = 4000;
@@ -122,7 +126,8 @@ export class ConsoleViewModel {
 
   async loadConfig(): Promise<void> {
     const loaded = await PreferencesRepository.getInstance().load();
-    this.rtmpUrl = loaded.rtmpUrl;
+    // 未配置过（或存的是空串）时回落到局域网默认地址，保证“直接点推流”可测
+    this.rtmpUrl = loaded.rtmpUrl.trim().length === 0 ? DEFAULT_RTMP_URL : loaded.rtmpUrl;
     this.preset = loaded.preset;
     this.fps = loaded.fps;
     this.videoBitrateKbps = loaded.videoBitrateKbps;

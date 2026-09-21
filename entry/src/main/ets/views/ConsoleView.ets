@@ -183,10 +183,13 @@ export struct ConsoleView {
       // —— 统计面板（录制时长单列展示）——
       Column({ space: 4 }) {
         Row({ space: 16 }) {
-          this.statItem('fps', this.vm.streamFps)
-          this.statItem('码率', `${this.vm.streamBitrate} kbps`)
-          this.statItem('已发', `${this.vm.sentBytes} KB`)
-          this.statItem('录制', this.vm.recordDuration)
+          // 注意：这里必须用「无参 @Builder」而非 statItem(label, value) 形式。
+          // @Builder 的值参数是快照，@Trace 字段变化后不会重算，统计会永远停在初值 0
+          // （真机现象：内联的「推流时长」正常刷新，而同区域的 fps/码率/已发恒为 0）。
+          this.statFps()
+          this.statBitrate()
+          this.statSent()
+          this.statRecord()
         }
         Text(`推流时长 ${this.vm.streamDuration}`)
           .fontSize(12)
@@ -237,9 +240,9 @@ export struct ConsoleView {
   statusCard() {
     Column({ space: 8 }) {
       Row({ space: 16 }) {
-        this.statusDot('采集', this.vm.captureStatus, this.captureColor(this.vm.captureStatus))
-        this.statusDot('推流', this.vm.streamStatus, this.streamColor(this.vm.streamStatus))
-        this.statusDot('录制', this.vm.recordStatus, this.recordColor(this.vm.recordStatus))
+        this.dotCapture()
+        this.dotStream()
+        this.dotRecord()
       }
       if (this.vm.reconnectAttempt > 0 && this.vm.streamStatus === StreamStatus.RECONNECTING) {
         Text(`重连中 (${this.vm.reconnectAttempt}/3)`)
@@ -253,12 +256,35 @@ export struct ConsoleView {
     .backgroundColor('#F7F7F7')
   }
 
+  // 三个无参 @Builder：@Builder 的「值参数」在首次构建时即快照，传 this.vm.xxxStatus 后
+  // @Trace 变化不会触发重算（真机现象：推流中状态行仍显示「空闲」、圆点恒灰）。
+  // 与统计面板同理，必须在 @Builder 内部直读 @Trace 字段才能响应式刷新。
   @Builder
-  statusDot(label: string, status: string, color: string) {
+  dotCapture() {
     Row({ space: 6 }) {
       Circle({ width: 10, height: 10 })
-        .fill(color)
-      Text(`${label}: ${this.statusLabel(status)}`)
+        .fill(this.captureColor(this.vm.captureStatus))
+      Text(`采集: ${this.statusLabel(this.vm.captureStatus)}`)
+        .fontSize(13)
+    }
+  }
+
+  @Builder
+  dotStream() {
+    Row({ space: 6 }) {
+      Circle({ width: 10, height: 10 })
+        .fill(this.streamColor(this.vm.streamStatus))
+      Text(`推流: ${this.statusLabel(this.vm.streamStatus)}`)
+        .fontSize(13)
+    }
+  }
+
+  @Builder
+  dotRecord() {
+    Row({ space: 6 }) {
+      Circle({ width: 10, height: 10 })
+        .fill(this.recordColor(this.vm.recordStatus))
+      Text(`录制: ${this.statusLabel(this.vm.recordStatus)}`)
         .fontSize(13)
     }
   }
@@ -315,12 +341,48 @@ export struct ConsoleView {
   }
 
   @Builder
-  statItem(label: string, value: string) {
+  statFps() {
     Column({ space: 2 }) {
-      Text(value)
+      Text(this.vm.streamFps)
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
-      Text(label)
+      Text('fps')
+        .fontSize(11)
+        .fontColor('#888888')
+    }
+  }
+
+  @Builder
+  statBitrate() {
+    Column({ space: 2 }) {
+      Text(`${this.vm.streamBitrate} kbps`)
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+      Text('码率')
+        .fontSize(11)
+        .fontColor('#888888')
+    }
+  }
+
+  @Builder
+  statSent() {
+    Column({ space: 2 }) {
+      Text(`${this.vm.sentBytes} KB`)
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+      Text('已发')
+        .fontSize(11)
+        .fontColor('#888888')
+    }
+  }
+
+  @Builder
+  statRecord() {
+    Column({ space: 2 }) {
+      Text(this.vm.recordDuration)
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+      Text('录制')
         .fontSize(11)
         .fontColor('#888888')
     }
