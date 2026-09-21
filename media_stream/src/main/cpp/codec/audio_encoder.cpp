@@ -82,6 +82,9 @@ bool AudioEncoder::Start(Callbacks callbacks) {
         return false;
     }
     running_ = true;
+    // 起播静音垫：等 OnNeedInputData 首次回调时投递一小段静音，把编码链路真正跑起来
+    primed_ = false;
+    realPcmSeen_ = false;
     MS_LOG_INFO("AudioEncoder started 48kHz stereo 128kbps AAC-LC");
     return true;
 }
@@ -100,6 +103,7 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
         if (!running_) {
             return;
         }
+        realPcmSeen_ = true; // 真实 PCM 到达：此后静音垫产物正常透传
         if (pcmQueue_.empty()) {
             pcmPtsNs_ = ptsNs;
         }
@@ -234,6 +238,23 @@ void AudioEncoder::OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
                 pushIdx = static_cast<int32_t>(index);
             }
         }
+        if (pushIdx < 0 && self->running_ && !self->primed_) {
+            // 起播静音垫：以零 PCM 把编码链路真正跑起来。产物在真实 PCM 到达前丢弃
+            // （见 OnNewOutputData），因此不占用音频时间轴。
+            size_t maxSamples = static_cast<size_t>(capacity) / 2;
+            size_t samples = kPrimingSamples < maxSamples ? kPrimingSamples : maxSamples;
+            samples &= ~static_cast<size_t>(1); // 双声道对齐
+            if (samples > 0) {
+                memset(addr, 0, samples * 2);
+                attr.pts = 0;
+                attr.size = static_cast<int32_t>(samples * 2);
+                attr.offset = 0;
+                attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+                pushIdx = static_cast<int32_t>(index);
+                self->primed_ = true;
+                MS_LOG_INFO("audio priming silence pushed (%{public}zu samples) to force ASC", samples);
+            }
+        }
         if (pushIdx < 0) {
             // 暂无音频：把当前输入槽 hold 住（不 Push），避免：
             //  1) 0 长缓冲 → PcmFillFrame 输入 0 采样刷屏 → APP_FREEZE；
@@ -271,6 +292,12 @@ void AudioEncoder::OnNewOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
             }
             MS_LOG_INFO("ASC from codec data buffer, %{public}d bytes", size);
         }
+        OH_AudioEncoder_FreeOutputData(codec, index);
+        return;
+    }
+
+    // 静音垫产物：真实 PCM 尚未喂入前全部丢弃，避免占用音频时间轴
+    if (self->primed_ && !self->realPcmSeen_) {
         OH_AudioEncoder_FreeOutputData(codec, index);
         return;
     }

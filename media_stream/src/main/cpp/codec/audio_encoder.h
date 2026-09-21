@@ -66,6 +66,14 @@ private:
     int32_t idleIndex_ = -1;
     OH_AVMemory *idleMem_ = nullptr;
 
+    // ── 起播静音垫 ──
+    // 编码器启动后的第一个输入槽先投一小段静音，把编码链路真正跑起来（首帧延迟、
+    // 内部缓冲就位）。这段静音的编码产物在「尚未喂入真实 PCM」期间全部丢弃，
+    // 不占用音频时间轴。
+    bool primed_ = false;       // 是否已投递过静音垫
+    bool realPcmSeen_ = false;  // 是否已喂入外部真实 PCM（true 后静音垫产物不再丢弃）
+    static constexpr size_t kPrimingSamples = 960 * 2; // 20ms @48k 双声道
+
     bool ascEmitted_ = false;
     std::vector<uint8_t> asc_;
 };

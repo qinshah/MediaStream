@@ -131,6 +131,8 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
         OH_AVFormat_SetStringValue(afmt, OH_MD_KEY_CODEC_MIME, OH_AVCODEC_MIMETYPE_AUDIO_AAC);
         OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_AUD_SAMPLE_RATE, 48000);
         OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_AUD_CHANNEL_COUNT, 2);
+        // 与官方录屏示例一致：显式声明 AAC-LC，便于封装器生成 esds 的 objectTypeIndication
+        OH_AVFormat_SetIntValue(afmt, OH_MD_KEY_PROFILE, AAC_PROFILE_LC);
         OH_AVFormat_SetBuffer(afmt, OH_MD_KEY_CODEC_CONFIG, asc_.data(), asc_.size());
         rc = OH_AVMuxer_AddTrack(muxer_, &audioTrack_, afmt);
         OH_AVFormat_Destroy(afmt);
