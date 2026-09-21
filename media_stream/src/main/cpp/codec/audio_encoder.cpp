@@ -22,7 +22,9 @@ static constexpr size_t kMaxQueueSamples = kSampleRate / 2 * kChannels;
 // 时间轴重锚阈值（ns）：队列取空时，若「到达时刻」与「采样计数时间轴」相差超过该值才重新锚定
 // （用于采集真断过、或长时运行后累积漂移的兜底）；小偏差一律保持采样计数，避免把回调抖动
 // 写进时间轴。
-static constexpr int64_t kPtsResyncThresholdNs = 100000000LL; // 100ms
+// 喂入时间轴重锚阈值。同 kOutResyncUs 的缘由：100ms 会让上述 1.5% 时钟偏差每约 7 秒
+// 就触发一次重锚，进而带动输出时间轴一起跳。放宽到 2s 只用于识别「采集真断过」。
+static constexpr int64_t kPtsResyncThresholdNs = 2000000000LL;
 
 AudioEncoder::~AudioEncoder() {
     Stop();

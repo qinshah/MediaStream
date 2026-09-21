@@ -79,7 +79,13 @@ private:
     bool firstFedSet_ = false;
     int64_t latestFedPtsUs_ = 0; // 最近一次喂入的 pts（用于前跳对齐）
     static constexpr int64_t kAacFrameUs = 1024000000LL / 48000; // 1024 采样 = 21333μs
-    static constexpr int64_t kOutResyncUs = 100000;              // 前跳阈值 100ms
+    // 输出时间轴前跳阈值。
+    // 原为 100ms，过小：采集时钟与标称 48kHz 存在约 1.5% 偏差（[SC-AUD] 实测每包 20.30ms
+    // 而非 20.00ms），而输出时间轴按采样数推进（每帧 21.333ms）、喂入时间按真实时钟走，
+    // 两者每秒漂约 15ms —— 约 7 秒就顶到 100ms 阈值，输出时间轴周期性前跳 100ms+。
+    // 播放器为此反复丢/补帧，听感就是周期性「电音」。放宽到 2s 后正常漂移不再触发，
+    // 只有采集真断过（>2s 空洞）才前跳对齐。
+    static constexpr int64_t kOutResyncUs = 2000000;
 
     void MarkFedLocked(int64_t ptsUs); // 记录喂入时间轴（须持 mutex_）
 

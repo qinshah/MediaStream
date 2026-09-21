@@ -74,7 +74,12 @@ private:
     };
 
     void WriteThreadMain();
+    // 归零点未定时的入口：缓存首样本，待两轨齐（或超时）后封零点；已定则直接落盘
     bool WriteOneSample(const Sample &sample);
+    // 归零点已定：真正调用 OH_AVMuxer_WriteSampleBuffer
+    bool WriteSampleNow(const Sample &sample);
+    // 由待定首样本求 min（两轨中较早者）作为归零点，保证没有一轨被钳位
+    void SealFirstPtsLocked();
 
     OH_AVMuxer *muxer_ = nullptr;
     int fd_ = -1;
@@ -92,6 +97,17 @@ private:
     std::string filePath_;
     // 首/末采样 pts（μs）仅用于 mp4 采样缓冲的相对 pts 归零
     std::atomic<int64_t> firstPtsUs_{-1};
+    // 归零点延迟确定（见 .cpp 注释）：录制起点的补帧是同步投递，会比异步的音频编码回调
+    // 更早到达写线程。若沿用「第一个写入的样本定零点」，内容更早的音频就成了负值被钳到 0，
+    // 多帧挤在同一时刻 → 爆音。这里改为等两轨首样本到齐，取较早者作零点。
+    std::vector<Sample> pendingFirst_;
+    bool firstSealed_ = false;
+    bool firstVideoIn_ = false;
+    bool firstAudioIn_ = false;
+    int64_t pendingFirstStartMs_ = 0;
+    bool hasVideoTrack_ = false;
+    bool hasAudioTrack_ = false;
+    std::atomic<int64_t> droppedEarly_{0};
     std::atomic<int64_t> lastPtsUs_{0};
     // 录制时长按真实墙钟计算（设备编码器 pts 绝对时钟不可靠，不能用 (last-first)/1000）
     std::atomic<int64_t> startSteadyMs_{0};

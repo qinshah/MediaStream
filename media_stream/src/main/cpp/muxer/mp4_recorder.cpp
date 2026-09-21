@@ -24,6 +24,17 @@ static constexpr int kErrInternal = 12;
 
 static constexpr size_t kWriteQueueCap = 600; // 阻塞策略；磁盘写快，常规不满
 
+// 归零点等待上限：等另一轨首样本最多这么久（单轨、或某轨长期无数据时兜底）
+static constexpr int64_t kFirstPtsWaitMs = 220;
+// 归零点待定期间允许缓存的最大样本数（防内存膨胀；正常 220ms 窗口内远达不到）
+static constexpr size_t kMaxPendingFirst = 96;
+
+static int64_t NowSteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 Mp4Recorder::~Mp4Recorder() {
     Stop();
 }
@@ -44,6 +55,12 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
     finished_ = false;
     writeThreadDone_ = false;
     firstPtsUs_ = -1;
+    firstSealed_ = false;
+    firstVideoIn_ = false;
+    firstAudioIn_ = false;
+    pendingFirst_.clear();
+    pendingFirstStartMs_ = 0;
+    droppedEarly_ = 0;
     lastPtsUs_ = 0;
     stopSteadyMs_ = 0;
     writtenBytes_ = 0;
@@ -146,6 +163,8 @@ bool Mp4Recorder::Start(const std::string &dirPath, int width, int height, const
         MS_LOG_INFO("no ASC (no system audio), record video-only");
     }
 
+    hasVideoTrack_ = (videoTrack_ >= 0);
+    hasAudioTrack_ = (audioTrack_ >= 0);
     rc = OH_AVMuxer_Start(muxer_);
     if (rc != AV_ERR_OK) {
         MS_LOG_ERROR("OH_AVMuxer_Start failed rc=%{public}d", rc);
@@ -249,7 +268,64 @@ bool Mp4Recorder::WaitWriteThreadDone(int64_t timeoutMs) {
     return true;
 }
 
+// 归零点确定前的入口：缓存首样本，等两轨齐（或超时）后取最小 ptsUs 作零点再落盘。
+// 为什么不能用「首个写入的样本定零点」：录制起点的补帧是同步投递，比异步的音频编码回调
+// 更早到达写线程；音频内容本身更早，却因此成为「负值」被钳到 0。实测一次 2.7s 录制里
+// 4 帧音频（85ms 内容）被压进 t=0 的 0.6ms 内，播放器瞬间连播即爆音；同时音轨时间轴
+// 总长比音频内容短 85ms，播放器必须全程补偿 —— 听感就是「电音」。
 bool Mp4Recorder::WriteOneSample(const Sample &sample) {
+    if (firstPtsUs_.load() < 0) {
+        if (sample.isVideo) {
+            firstVideoIn_ = true;
+        } else {
+            firstAudioIn_ = true;
+        }
+        if (pendingFirst_.empty()) {
+            pendingFirstStartMs_ = NowSteadyMs();
+        }
+        pendingFirst_.push_back(sample);
+        const bool videoReady = firstVideoIn_ || !hasVideoTrack_;
+        const bool audioReady = firstAudioIn_ || !hasAudioTrack_;
+        const bool timeout = (NowSteadyMs() - pendingFirstStartMs_) >= kFirstPtsWaitMs;
+        // 单轨、或某轨长期无数据时不能无限等待：超时或缓存够多就用现有样本定零点
+        if (!(videoReady && audioReady) && !timeout && pendingFirst_.size() < kMaxPendingFirst) {
+            return true;
+        }
+        SealFirstPtsLocked();
+        std::vector<Sample> pend = std::move(pendingFirst_);
+        pendingFirst_.clear();
+        for (const Sample &ps : pend) {
+            if (!WriteSampleNow(ps)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return WriteSampleNow(sample);
+}
+
+// 由已缓存的首样本确定归零点：取两轨中最早的那个，保证没有任何一轨被钳位。
+void Mp4Recorder::SealFirstPtsLocked() {
+    if (firstSealed_) {
+        return;
+    }
+    firstSealed_ = true;
+    int64_t base = pendingFirst_.empty() ? 0 : pendingFirst_.front().ptsUs;
+    for (const Sample &ps : pendingFirst_) {
+        if (ps.ptsUs < base) {
+            base = ps.ptsUs;
+        }
+    }
+    if (base < 0) {
+        base = 0;
+    }
+    firstPtsUs_.store(base);
+    MS_LOG_WARN("[MP4-BASE] firstPtsUs=%{public}lld sealed (pending=%{public}zu video=%{public}d audio=%{public}d)",
+                static_cast<long long>(base), pendingFirst_.size(), firstVideoIn_ ? 1 : 0,
+                firstAudioIn_ ? 1 : 0);
+}
+
+bool Mp4Recorder::WriteSampleNow(const Sample &sample) {
     OH_AVBuffer *buffer = OH_AVBuffer_Create(static_cast<int32_t>(sample.data.size()));
     if (buffer == nullptr) {
         return false;
@@ -257,27 +333,20 @@ bool Mp4Recorder::WriteOneSample(const Sample &sample) {
     uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
     memcpy(addr, sample.data.data(), sample.data.size());
     OH_AVCodecBufferAttr attr = {};
-    // pts 归零：以首采样为起点，单调递增
-    int64_t first = firstPtsUs_.load();
-    if (first < 0) {
-        firstPtsUs_.compare_exchange_strong(first, sample.ptsUs);
-        first = sample.ptsUs;
-        // 诊断：归零点由「第一个被写入的样本」决定（音频先到则等于音频首包时间戳）
-        MS_LOG_WARN("[MP4-BASE] firstPtsUs=%{public}lld from %{public}s", static_cast<long long>(first),
-                    sample.isVideo ? "video" : "audio");
+    // pts 归零：以归零点为起点，单调递增
+    const int64_t first = firstPtsUs_.load();
+    if (sample.ptsUs < first) {
+        // 早于归零点：其内容发生在本次输出起点之前，直接丢弃。
+        // 不能像以前那样钳到 0 —— 多帧挤在同一时刻会被播放器瞬间连播，听感即爆音。
+        int64_t n = droppedEarly_.fetch_add(1) + 1;
+        if (n <= 5) {
+            MS_LOG_WARN("[MP4-EARLY] drop %{public}s sample rawPtsUs=%{public}lld < firstPtsUs=%{public}lld (n=%{public}lld)",
+                        sample.isVideo ? "video" : "audio", static_cast<long long>(sample.ptsUs),
+                        static_cast<long long>(first), static_cast<long long>(n));
+        }
+        return true;
     }
     attr.pts = sample.ptsUs - first;
-    if (attr.pts < 0) {
-        attr.pts = 0;
-        // 诊断：负值被钳到 0 —— 说明该样本早于归零点（时间戳错序），播放时会堆在同一时刻
-        static std::atomic<int> negCtr{0};
-        int nc = negCtr.fetch_add(1);
-        if (nc < 3 || nc % 500 == 0) {
-            MS_LOG_WARN("[MP4-NEG] %{public}s rawPtsUs=%{public}lld < firstPtsUs=%{public}lld (clamped to 0, n=%{public}d)",
-                        sample.isVideo ? "video" : "audio", static_cast<long long>(sample.ptsUs),
-                        static_cast<long long>(first), nc);
-        }
-    }
     // 临时诊断：首/尾及每1000样本记录 ptsUs 与归零后 pts，判断时间线是否异常
     int64_t cnt = writtenSamples_.load();
     if (cnt < 3 || cnt % 1000 == 0) {
@@ -334,6 +403,17 @@ void Mp4Recorder::WriteThreadMain() {
     while (queue_ && queue_->Pop(s)) {
         if (!WriteOneSample(s)) {
             break; // 存储错误：停止写入，走异常收尾
+        }
+    }
+    // 极短录制兜底：队列排空时若另一轨首样本始终没来，归零点仍未定，这里补一次落盘
+    if (!pendingFirst_.empty()) {
+        SealFirstPtsLocked();
+        std::vector<Sample> pend = std::move(pendingFirst_);
+        pendingFirst_.clear();
+        for (const Sample &ps : pend) {
+            if (!WriteSampleNow(ps)) {
+                break;
+            }
         }
     }
 

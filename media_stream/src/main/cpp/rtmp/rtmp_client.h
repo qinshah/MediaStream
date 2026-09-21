@@ -65,6 +65,10 @@ public:
     int64_t SentBytes() const { return sentBytes_.load(); }
     int64_t DroppedVideoFrames() const { return droppedVideoFrames_.load(); }
     int64_t PtsUsToMs(int64_t ptsUs); // 会话内 pts 转 FLV 毫秒
+    // 由引擎在推流启动后设定时间轴基点（会话相对 μs）。若不设定而退化为「首个到达帧的 pts」，
+    // 同步产出的视频帧会抢定基点，内容更早的音频被钳到 0 —— 多帧挤在同一时间戳，拉流端
+    // 瞬间连播即爆音。设定后早于基点的帧直接丢弃（内容本就发生在推流开始之前）。
+    void SetPtsBase(int64_t ptsUs);
 
 private:
     struct RtmpUrl {
@@ -143,7 +147,8 @@ private:
     std::atomic<bool> sentAudioSeqHdr_{false};
     std::atomic<int64_t> sentBytes_{0};
     std::atomic<int64_t> droppedVideoFrames_{0};
-    std::atomic<int64_t> basePtsUs_{-1}; // 会话 epoch（首帧 pts）
+    std::atomic<int64_t> basePtsUs_{-1}; // 会话 epoch（推流启动由引擎设定；-1=未定则退化为首帧）
+    std::atomic<int64_t> droppedEarlyFrames_{0}; // 早于 epoch 被丢弃的帧数（内容早于推流起点）
 
     // 接收侧 chunk 重组状态
     static constexpr int kMaxChunkStreams = 8;

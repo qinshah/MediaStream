@@ -220,6 +220,11 @@ void RtmpClient::SetMetaData(int width, int height, int fps, int videoBitrateKbp
     ConfigMaybeEnqueue();
 }
 
+void RtmpClient::SetPtsBase(int64_t ptsUs) {
+    basePtsUs_.store(ptsUs);
+    MS_LOG_INFO("[RTMP-BASE] pts base set to %{public}lld us", static_cast<long long>(ptsUs));
+}
+
 int64_t RtmpClient::PtsUsToMs(int64_t ptsUs) {
     int64_t base = basePtsUs_.load();
     if (base < 0) {
@@ -232,6 +237,13 @@ int64_t RtmpClient::PtsUsToMs(int64_t ptsUs) {
 
 void RtmpClient::SendVideo(const uint8_t *data, int32_t size, int64_t ptsUs, bool isKeyframe) {
     if (state_.load() != State::kStreaming && state_.load() != State::kReconnecting) {
+        return;
+    }
+    const int64_t ptsBase = basePtsUs_.load();
+    if (ptsBase >= 0 && ptsUs < ptsBase) {
+        // 早于推流起点：内容发生在推流开始之前，丢弃而不是钳到 0
+        // （钳位会让多帧挤在同一时间戳，拉流端瞬间连播 → 爆音）
+        droppedEarlyFrames_.fetch_add(1);
         return;
     }
     if (!sentVideoSeqHdr_.load()) {
@@ -252,6 +264,12 @@ void RtmpClient::SendVideo(const uint8_t *data, int32_t size, int64_t ptsUs, boo
 
 void RtmpClient::SendAudio(const uint8_t *data, int32_t size, int64_t ptsUs) {
     if (state_.load() != State::kStreaming && state_.load() != State::kReconnecting) {
+        return;
+    }
+    const int64_t ptsBase = basePtsUs_.load();
+    if (ptsBase >= 0 && ptsUs < ptsBase) {
+        // 同 SendVideo：早于推流起点的音频帧丢弃而非钳到 0
+        droppedEarlyFrames_.fetch_add(1);
         return;
     }
     if (!sentAudioSeqHdr_.load()) {

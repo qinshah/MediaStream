@@ -362,6 +362,12 @@ bool MediaStreamEngine::StartStreaming(const Config &config, int &errCode, std::
         return false;
     }
 
+    // 推流时间轴基点 = 本次推流启动时刻。音频编码器早于此刻产出的帧（例如"先开始采集、
+    // 再点推流"时已积压在管线里的那一小段）不属于本次推流：若不设基点而让「首个到达帧」
+    // 决定，同步的补帧会抢到基点，把内容更早的音频钳到 0 —— 多帧挤在同一时间戳，拉流端
+    // 瞬间连播即爆音。必须在 Start 之后设定（Start 内部会把基点重置为 -1）。
+    rtmpClient_->SetPtsBase(SessionRelativeNs(NowNs()) / 1000);
+
     EmitCaptureState("active");
     captureState_ = "active";
     StartStatsLocked();
