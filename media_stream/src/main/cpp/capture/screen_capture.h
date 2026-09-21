@@ -133,6 +133,7 @@ private:
     void LogAudioCadence(bool isMic, int32_t bytes, int64_t nowNs);
     std::atomic<int64_t> audioLastNs_[2];
     std::atomic<int64_t> audioAccNs_[2];
+    std::atomic<int64_t> audioGapCnt_[2];
     std::atomic<int> audioCount_[2];
 };
 

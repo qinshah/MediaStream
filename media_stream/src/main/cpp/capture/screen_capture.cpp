@@ -412,19 +412,28 @@ void ScreenCapture::LogAudioCadence(bool isMic, int32_t bytes, int64_t nowNs) {
     int64_t prev = audioLastNs_[idx].exchange(nowNs);
     if (prev > 0 && nowNs > prev) {
         audioAccNs_[idx].fetch_add(nowNs - prev);
+        audioGapCnt_[idx].fetch_add(1);
     }
     int n = audioCount_[idx].fetch_add(1) + 1;
     if ((n & 0x3F) != 0) {
         return;
     }
     int64_t total = audioAccNs_[idx].exchange(0);
-    int64_t avgUs = total / 63;
-    // 折算采样率 = 本包声道帧数 ÷ 平均间隔（每包 4 字节 = 1 个双声道采样帧）
+    // 除数必须用「本窗口真正累计到的间隔数」而不是常数：首个窗口在 n=64 时只有 63 个间隔，
+    // 其后每个窗口（n=65..128 等）累计的是 64 个间隔。原先固定除以 63 会把后者系统性放大
+    // 约 1.6%（20.00ms→20.32ms），曾据此误判「采集时钟比标称 48kHz 慢 1.5%」，代价很大。
+    int64_t gaps = audioGapCnt_[idx].exchange(0);
+    if (gaps <= 0) {
+        gaps = 1;
+    }
+    int64_t avgNs = total / gaps;
+    // 折算采样率 = 本包声道帧数 ÷ 平均间隔（每包 4 字节 = 1 个双声道采样帧）。
+    // 注意 avgNs 单位是**纳秒**，故系数用 1e9（原写 1e6 且标签写成 us，日志值小了 1000 倍）。
     int64_t frames = bytes / 4;
-    int64_t impliedRate = avgUs > 0 ? frames * 1000000 / avgUs : 0;
-    MS_LOG_INFO("[SC-AUD] %{public}s n=%{public}d bytes=%{public}d avgDelta=%{public}lldus rate=%{public}lldHz",
-                isMic ? "mic" : "inner", n, bytes, static_cast<long long>(avgUs),
-                static_cast<long long>(impliedRate));
+    int64_t impliedRate = avgNs > 0 ? frames * 1000000000LL / avgNs : 0;
+    MS_LOG_INFO("[SC-AUD] %{public}s n=%{public}d bytes=%{public}d avgDeltaNs=%{public}lld gaps=%{public}lld rate=%{public}lldHz",
+                isMic ? "mic" : "inner", n, bytes, static_cast<long long>(avgNs),
+                static_cast<long long>(gaps), static_cast<long long>(impliedRate));
 }
 
 } // namespace media_stream
