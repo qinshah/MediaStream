@@ -6,6 +6,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ConsoleViewModel } from '../viewmodel/ConsoleViewModel';
 import { PRESETS, AUDIO_SOURCES, ROUTE_RECORDINGS, PresetOption, AudioOption } from '../model/Types';
 import { StreamStatus, RecordStatus, CaptureStatus } from '../service/MediaStreamService';
+import { MicAuthResult } from '../service/PermissionService';
 
 const DOMAIN = 0x0000;
 const TAG = 'ConsoleView';
@@ -49,9 +50,13 @@ export struct ConsoleView {
   }
 
   presentDegrade(): void {
+    // 按申请走到哪一级给出准确文案：走到设置级说明已把用户带到开关前仍未打开
+    const msg = this.vm.micAuthStage === MicAuthResult.DENIED_SETTING_LEVEL
+      ? '麦克风权限未开启（已尝试应用授权弹窗与权限设置页）。是否仅录制系统声音继续？'
+      : '未获得麦克风权限，是否仅录制系统声音继续？';
     this.getUIContext().showAlertDialog({
       title: '麦克风未授权',
-      message: '未获得麦克风权限，是否仅录制系统声音继续？',
+      message: msg,
       primaryButton: {
         value: '继续',
         action: () => {
@@ -148,6 +153,20 @@ export struct ConsoleView {
           }
           .width('100%')
 
+          // 麦克风授权入口：未授权时给出明确可点入口（同样走应用级 → 设置级两级申请）
+          if (this.vm.needsMic() && !this.vm.micGranted) {
+            Row({ space: 4 }) {
+              Text('麦克风未授权')
+                .fontSize(12)
+                .fontColor('#F5A623')
+              Text('· 点击授权')
+                .fontSize(12)
+                .fontColor('#0A59F7')
+            }
+            .width('100%')
+            .onClick(() => this.vm.requestMicAuth())
+          }
+
           // —— 状态徽标 ——
           this.statusCard()
 
@@ -161,9 +180,12 @@ export struct ConsoleView {
 
           // —— 操作按钮 ——
           Row({ space: 12 }) {
-            Button(this.vm.isStreamingActive() ? '停止推流' : '开始推流')
+            Button(this.streamButtonLabel())
               .width('48%')
               .height(48)
+              // 预检进行中禁止重复点击，避免并发拉起多次推流
+              .enabled(!this.vm.probing)
+              .opacity(this.vm.probing ? 0.6 : 1)
               .backgroundColor(this.vm.isStreamingActive() ? '#D93026' : '#0A59F7')
               .onClick(() => this.vm.toggleStream())
 
@@ -201,6 +223,13 @@ export struct ConsoleView {
     }
     .width('100%')
     .height('100%')
+  }
+
+  streamButtonLabel(): string {
+    if (this.vm.probing) {
+      return '检测服务器…';
+    }
+    return this.vm.isStreamingActive() ? '停止推流' : '开始推流';
   }
 
   @Builder

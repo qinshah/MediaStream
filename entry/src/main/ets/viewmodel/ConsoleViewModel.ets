@@ -12,9 +12,11 @@ import {
   RecordingMeta,
   SessionStats,
 } from '../service/MediaStreamService';
+import { ErrorCode } from 'media_stream';
 import { PreferencesRepository } from '../data/PreferencesRepository';
 import { RecordingsRepository } from '../data/RecordingsRepository';
-import { PermissionService } from '../service/PermissionService';
+import { PermissionService, MicAuthResult } from '../service/PermissionService';
+import { parseRtmpTarget, probeRtmpServer, RtmpTarget } from '../service/RtmpProbe';
 import { BackgroundTaskService } from '../service/BackgroundTaskService';
 import { errorMessage } from '../model/Types';
 
@@ -84,6 +86,12 @@ export class ConsoleViewModel {
   @Trace streamDuration: string = '0s';
   @Trace recordDuration: string = '0s';
   @Trace reconnectAttempt: number = 0;
+  // 推流地址连通性预检中（按钮显示「检测服务器…」并禁止重复点击）
+  @Trace probing: boolean = false;
+  // 麦克风授权镜像：用于在音频源下方给出「未授权 → 点击授权」入口
+  @Trace micGranted: boolean = false;
+  // 上一次麦克风申请走到哪一级（应用级/设置级），决定降级弹窗文案
+  @Trace micAuthStage: string = '';
 
   // —— 错误/提示 ——
   @Trace errorText: string = '';
@@ -122,6 +130,7 @@ export class ConsoleViewModel {
     await PreferencesRepository.getInstance().init(context);
     await this.loadConfig();
     this.service.init(context.filesDir);
+    this.refreshMicState();
   }
 
   async loadConfig(): Promise<void> {
@@ -179,17 +188,81 @@ export class ConsoleViewModel {
   }
 
   startStream(): void {
-    if (this.rtmpUrl.trim().length === 0) {
-      this.errorText = errorMessage(7); // RTMP_URL_INVALID
+    const target: RtmpTarget | null = parseRtmpTarget(this.rtmpUrl);
+    if (target === null) {
+      this.errorText = errorMessage(ErrorCode.RTMP_URL_INVALID);
       return;
     }
-    if (!this.rtmpUrl.startsWith('rtmp://')) {
-      this.errorText = errorMessage(7);
-      return;
+    if (this.probing) {
+      return; // 预检进行中，忽略重复点击
     }
+    // 取出标量，避免在回调闭包里依赖可空对象的类型收窄
+    const host = target.host;
+    const port = target.port;
     this.errorText = '';
     this.persistConfig();
-    this.gateMic('stream');
+    this.probing = true;
+    // 「不存在的服务器不应能开始推流」：先做一次 TCP 可达性预检，不可达直接中止，
+    // 不进入采集/推流（否则会白弹一次录屏授权、界面先切到「连接中」再报错）。
+    probeRtmpServer(target).then((reachable: boolean) => {
+      this.probing = false;
+      if (!reachable) {
+        this.failWith(ErrorCode.RTMP_CONNECT_FAIL,
+          `无法连接到服务器 ${host}:${port}，请确认服务器已启动且与本机网络互通`);
+        return;
+      }
+      this.gateMic('stream');
+    }).catch((e: Error) => {
+      this.probing = false;
+      hilog.error(DOMAIN, TAG, 'probe server err %{public}s', JSON.stringify(e));
+      this.failWith(ErrorCode.RTMP_CONNECT_FAIL, '推流服务器连通性检查失败，请重试');
+    });
+  }
+
+  // 当前音频源是否需要麦克风
+  needsMic(): boolean {
+    return this.audioMode === 'mic' || this.audioMode === 'micInner';
+  }
+
+  // 同步麦克风授权镜像（授权弹窗/设置页返回后调用）
+  refreshMicState(): void {
+    const ctx = this.context;
+    if (!ctx) {
+      return;
+    }
+    try {
+      this.micGranted = PermissionService.getInstance().hasMicPermission(ctx);
+    } catch (e) {
+      this.micGranted = false;
+    }
+  }
+
+  // 用户点击「麦克风未授权」提示时手动发起授权，链路与开始推流时一致（应用级 → 设置级）
+  requestMicAuth(): void {
+    const ctx = this.context;
+    if (!ctx) {
+      return;
+    }
+    PermissionService.getInstance().ensureMicPermission(ctx).then((auth: MicAuthResult) => {
+      this.micAuthStage = auth;
+      this.micGranted = auth === MicAuthResult.GRANTED;
+      if (auth === MicAuthResult.GUIDED_TO_SETTINGS) {
+        this.errorText = '请在系统设置中开启麦克风权限';
+      }
+    }).catch((e: Error) => {
+      hilog.error(DOMAIN, TAG, 'requestMicAuth err %{public}s', JSON.stringify(e));
+    });
+  }
+
+  // 与原生 error 事件区分：调用方已给出更具体的文案（如带 host:port），不查错误码表直接展示
+  private failWith(code: number, detail: string): void {
+    this.errorCode = code;
+    this.errorText = detail;
+    this.showErrorDialog = true;
+    if (this.dialogErrorHandler) {
+      this.dialogErrorHandler();
+    }
+    hilog.error(DOMAIN, TAG, 'fail code=%{public}d msg=%{public}s', code, detail);
   }
 
   startRecord(): void {
@@ -199,33 +272,52 @@ export class ConsoleViewModel {
   }
 
   private gateMic(action: string): void {
-    const needsMic = this.audioMode === 'mic' || this.audioMode === 'micInner';
-    if (needsMic && this.context) {
-      if (!PermissionService.getInstance().hasMicPermission(this.context)) {
-        // 未授权：先自动发起麦克风权限申请（系统弹窗），授予后继续；拒绝再降级为"仅内录继续/取消"
-        this.pendingAction = action;
-        PermissionService.getInstance().requestMicPermission(this.context).then(granted => {
-          if (!granted) {
-            // 用户拒绝授权 + 未勾选"不再询问"：弹出仅内录继续/取消
-            this.pendingMicDegradeConfirm = true;
-            if (this.dialogDegradeHandler) {
-              this.dialogDegradeHandler();
-            }
-          } else {
-            // 授权成功，直接开始
-            this.pendingMicDegradeConfirm = false;
-            this.applyAction(action);
-          }
-        });
+    const ctx = this.context;
+    if (!this.needsMic() || !ctx) {
+      this.applyAction(action);
+      return;
+    }
+    if (PermissionService.getInstance().hasMicPermission(ctx)) {
+      this.micGranted = true;
+      this.applyAction(action);
+      return;
+    }
+    // 两级申请：应用级系统弹窗 → 仍被拒则拉起权限设置弹窗（把用户直接送到麦克风开关前）。
+    // 弹窗异步返回，任一级通过即自动继续；两级都不通过才弹「仅内录继续/取消」。
+    this.pendingAction = action;
+    PermissionService.getInstance().ensureMicPermission(ctx).then((auth: MicAuthResult) => {
+      this.refreshMicState();
+      this.micAuthStage = auth;
+      if (auth === MicAuthResult.GRANTED) {
+        this.pendingMicDegradeConfirm = false;
+        this.applyAction(action);
         return;
       }
-    }
-    this.applyAction(action);
+      if (auth === MicAuthResult.GUIDED_TO_SETTINGS) {
+        // 已把用户送到系统设置页：此刻不能判定失败（用户尚未操作），也不弹降级确认，
+        // 只留一行提示；用户在设置里打开麦克风后重新点开始即可。
+        this.pendingMicDegradeConfirm = false;
+        this.errorText = '请在系统设置中开启麦克风权限后重新开始';
+        return;
+      }
+      this.pendingMicDegradeConfirm = true;
+      if (this.dialogDegradeHandler) {
+        this.dialogDegradeHandler();
+      }
+    }).catch((e: Error) => {
+      hilog.error(DOMAIN, TAG, 'ensure mic permission err %{public}s', JSON.stringify(e));
+      this.micAuthStage = MicAuthResult.DENIED_SETTING_LEVEL;
+      this.pendingMicDegradeConfirm = true;
+      if (this.dialogDegradeHandler) {
+        this.dialogDegradeHandler();
+      }
+    });
   }
 
   // 用户选择"继续=仅内录"：降级音频源为 inner 后开始
   confirmDegrade(): void {
     this.pendingMicDegradeConfirm = false;
+    this.micAuthStage = '';
     this.audioMode = 'inner';
     this.micDegraded = true;
     this.persistConfig();
@@ -293,6 +385,12 @@ export class ConsoleViewModel {
 
   applyStreamState(state: StreamStatus): void {
     this.streamStatus = state;
+    // 推流结束后统计线程不再上报，fps/码率会停在最后一帧的值（真机现象：已停止仍显示 12fps/617kbps）。
+    // 「已发」由 sentBytes 的绝对值体现不受影响，这里只清零瞬时速率。
+    if (state === StreamStatus.IDLE || state === StreamStatus.STOPPED) {
+      this.streamFps = '0';
+      this.streamBitrate = '0';
+    }
     this.updateLocked();
   }
 
@@ -302,13 +400,18 @@ export class ConsoleViewModel {
   }
 
   applyStats(stats: SessionStats): void {
-    const fpsVal = stats.videoFps;
-    if (typeof fpsVal === 'number') {
-      this.streamFps = fpsVal.toFixed(0);
-    }
-    const bitVal = stats.videoBitrateKbps;
-    if (typeof bitVal === 'number') {
-      this.streamBitrate = bitVal.toFixed(0);
+    // 瞬时速率只在推流进行中更新：停止时刻还会有一个「在途」的 stats 事件到达，
+    // 若照单全收会把 applyStreamState 里刚清零的 fps/码率又填回最后一帧的值，
+    // 表现为「已停止但仍显示 720kbps」。（已发/时长是累计量，不受此限制。）
+    if (this.isStreamingActive()) {
+      const fpsVal = stats.videoFps;
+      if (typeof fpsVal === 'number') {
+        this.streamFps = fpsVal.toFixed(0);
+      }
+      const bitVal = stats.videoBitrateKbps;
+      if (typeof bitVal === 'number') {
+        this.streamBitrate = bitVal.toFixed(0);
+      }
     }
     const sentVal = stats.sentBytes;
     if (typeof sentVal === 'number') {
