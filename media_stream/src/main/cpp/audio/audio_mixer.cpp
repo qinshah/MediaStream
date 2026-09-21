@@ -37,9 +37,7 @@ void AudioMixer::PushInner(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
     }
     innerQueue_.insert(innerQueue_.end(), in, in + samples);
     // 防积压：内录队列上限 200ms
-    while (innerQueue_.size() > kChunkSamples * 10) {
-        innerQueue_.pop_front();
-    }
+    DropOldestLocked(innerQueue_, droppedInner_, "inner");
     TryMixLocked();
 }
 
@@ -64,10 +62,25 @@ void AudioMixer::PushMic(const uint8_t *pcm, int32_t bytes, int64_t ptsNs) {
         micPtsNs_ = ptsNs;
     }
     micQueue_.insert(micQueue_.end(), in, in + samples);
-    while (micQueue_.size() > kChunkSamples * 10) {
-        micQueue_.pop_front();
-    }
+    DropOldestLocked(micQueue_, droppedMic_, "mic");
     TryMixLocked();
+}
+
+// 超上限则丢弃最旧样本。丢样本会在波形上留下跳变（听感为咔哒/电音），所以只在真的积压时
+// 发生，并按「每累计丢满 200ms」打一条告警：这样「电音」类问题能直接从日志区分是混音器在丢，
+// 还是编码器/时间戳的问题。
+void AudioMixer::DropOldestLocked(std::deque<int16_t> &q, int64_t &dropped, const char *tag) {
+    const size_t cap = kChunkSamples * 10; // 200ms = 19200 采样
+    bool didDrop = false;
+    while (q.size() > cap) {
+        q.pop_front();
+        dropped++;
+        didDrop = true;
+    }
+    if (didDrop && (dropped % static_cast<int64_t>(cap)) == 0) {
+        MS_LOG_WARN("[MIX] %{public}s queue backlog, dropped %{public}lldms of samples total",
+                    tag, static_cast<long long>(dropped * 1000 / (48000 * 2)));
+    }
 }
 
 void AudioMixer::TryMixLocked() {
@@ -104,6 +117,8 @@ void AudioMixer::Reset() {
     innerQueue_.clear();
     micQueue_.clear();
     micEverReceived_ = false;
+    droppedInner_ = 0;
+    droppedMic_ = 0;
 }
 
 } // namespace media_stream

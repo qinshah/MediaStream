@@ -58,7 +58,30 @@ private:
 
     // PCM 输入队列（采样点为单位，s16）
     std::deque<int16_t> pcmQueue_;
+    // 音频时间轴（ns）：锚定一次之后就**只按采样点数推进**，不随回调到达时刻漂移。
+    // 锚点由调用方给定，且必须是「会话相对时间」（与视频 PTS 同原点），否则两侧时间轴错源，
+    // 播放器为对齐而丢/补帧 → 电音；MP4 侧则表现为开头缺一段画面。
     int64_t pcmPtsNs_ = 0;
+    bool ptsAnchored_ = false; // 是否已锚定（未锚定时首次真实 PCM 直接落锚）
+
+    // ── 输出帧时间轴（μs）──
+    // 关键：OH_AudioEncoder 输出缓冲的 pts **不是**我们喂进去的输入 pts。真机实测（[AENC-IN]/
+    // [AENC-OUT]）：喂入会话相对时间 9060228μs，输出却是 21333μs（= 帧序号 × 1024/48000s）。
+    // 也就是说编码器自持一套「从 0 起、按输出帧数推进」的计数器，与采集/会话时钟毫无关系。
+    // 直接采信它会让音频与视频（会话时钟）时间轴错源：MP4 里音频早于视频首帧的那一大段被
+    // 封装器钳到 0（`[MP4-NEG]`），成片音频全堆在起点 —— 听感即电音、音轨时长还会截断；
+    // RTMP 侧同样表现为音视频错源。
+    // 因此输出帧的 pts 由本类自维护：首帧用首包真实 PCM 的喂入时间锚定，之后每输出一帧推进
+    // 一个 AAC 帧时长；若喂入侧时间已跑到前面（采集真断过/授权等待）则只**前跳**对齐，绝不回退。
+    int64_t outPtsUs_ = 0;
+    bool outAnchored_ = false;
+    int64_t firstFedPtsUs_ = 0;  // 首个真实 PCM 的喂入 pts（输出帧时间轴的锚点）
+    bool firstFedSet_ = false;
+    int64_t latestFedPtsUs_ = 0; // 最近一次喂入的 pts（用于前跳对齐）
+    static constexpr int64_t kAacFrameUs = 1024000000LL / 48000; // 1024 采样 = 21333μs
+    static constexpr int64_t kOutResyncUs = 100000;              // 前跳阈值 100ms
+
+    void MarkFedLocked(int64_t ptsUs); // 记录喂入时间轴（须持 mutex_）
 
     // OBS 式解耦：onNeedInputData 在无数据时不紧张循环（避免编码器 Stop 阻塞）。
     // 无数据时暂留一个输入槽（idleIndex_/idleMem_，不 Push），等 InputPcm 有真实音频后再填回，

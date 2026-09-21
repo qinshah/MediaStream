@@ -126,6 +126,14 @@ private:
     std::atomic<int64_t> probeLastLogNs_{0};
     std::atomic<int64_t> probeWinRecv_{0};
     std::atomic<int64_t> probeWinPass_{0};
+
+    // 音频到达节奏诊断（每 64 包一条日志）：包长 ÷ 到达间隔 应与声明的 48000Hz 自洽。
+    // 若实测偏离，说明系统投递的实际采样率/包长与我们的假设不符 —— 混音器按固定 20ms
+    // 块对齐两路输入时，节奏不一致会反复空转（一路饿死）或持续丢样本，听感就是电音/断续。
+    void LogAudioCadence(bool isMic, int32_t bytes, int64_t nowNs);
+    std::atomic<int64_t> audioLastNs_[2];
+    std::atomic<int64_t> audioAccNs_[2];
+    std::atomic<int> audioCount_[2];
 };
 
 } // namespace media_stream

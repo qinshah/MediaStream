@@ -19,6 +19,11 @@ static constexpr int kBitrate = 128000;
 // 队列上限：500ms = 24000 采样/声道
 static constexpr size_t kMaxQueueSamples = kSampleRate / 2 * kChannels;
 
+// 时间轴重锚阈值（ns）：队列取空时，若「到达时刻」与「采样计数时间轴」相差超过该值才重新锚定
+// （用于采集真断过、或长时运行后累积漂移的兜底）；小偏差一律保持采样计数，避免把回调抖动
+// 写进时间轴。
+static constexpr int64_t kPtsResyncThresholdNs = 100000000LL; // 100ms
+
 AudioEncoder::~AudioEncoder() {
     Stop();
 }
@@ -34,6 +39,13 @@ bool AudioEncoder::Start(Callbacks callbacks) {
     asc_.clear();
     idleIndex_ = -1;
     idleMem_ = nullptr;
+    pcmPtsNs_ = 0;
+    ptsAnchored_ = false; // 本会话尚未锚定：首包真实 PCM 落到调用方给定的会话相对时间上
+    outPtsUs_ = 0;
+    outAnchored_ = false;
+    firstFedPtsUs_ = 0;
+    firstFedSet_ = false;
+    latestFedPtsUs_ = 0;
 
     encoder_ = OH_AudioEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_AUDIO_AAC);
     if (encoder_ == nullptr) {
@@ -104,8 +116,16 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
             return;
         }
         realPcmSeen_ = true; // 真实 PCM 到达：此后静音垫产物正常透传
+        // 时间轴：只锚定一次（或偏差过大时重锚），之后按采样点数推进，不吸收回调抖动。
+        // 旧行为是「每次队列取空就 pcmPtsNs_ = 到达时刻」，而 InputPcm 每次都把队列灌进暂留槽、
+        // 队列基本总是取空 —— 等于音频 PTS 直接取原始到达时间，20ms 包的到达抖动（数毫秒）
+        // 全部写进时间轴，播放器为对齐而反复丢/补帧，听感就是电音。
         if (pcmQueue_.empty()) {
-            pcmPtsNs_ = ptsNs;
+            const int64_t driftNs = ptsNs - pcmPtsNs_;
+            if (!ptsAnchored_ || driftNs > kPtsResyncThresholdNs || driftNs < -kPtsResyncThresholdNs) {
+                pcmPtsNs_ = ptsNs;
+                ptsAnchored_ = true;
+            }
         }
         size_t samples = static_cast<size_t>(bytes) / 2;
         pcmQueue_.insert(pcmQueue_.end(), pcm, pcm + samples);
@@ -129,6 +149,7 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
                     pcmQueue_.pop_front();
                 }
                 pushPtsUs = static_cast<int32_t>(pcmPtsNs_ / 1000);
+                MarkFedLocked(pushPtsUs); // 记录喂入时间轴：输出帧时间轴以它为准
                 pcmPtsNs_ += static_cast<int64_t>(n) * 1000000000LL / (kSampleRate * kChannels);
                 pushSize = static_cast<int32_t>(n * 2);
                 pushIdx = idleIndex_;
@@ -143,8 +164,24 @@ void AudioEncoder::InputPcm(const int16_t *pcm, int32_t bytes, int64_t ptsNs) {
         attr.size = pushSize;
         attr.offset = 0;
         attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+        // 诊断：确认喂进编码器的会话相对时间轴（前 3 包 + 每 1000 包）
+        static std::atomic<int> inCtr{0};
+        int ic = inCtr.fetch_add(1);
+        if (ic < 3 || ic % 1000 == 0) {
+            MS_LOG_WARN("[AENC-IN] #%{public}d fedPtsUs=%{public}d samples=%{public}d", ic, pushPtsUs,
+                        pushSize / 2);
+        }
         OH_AudioEncoder_PushInputData(encoder_, static_cast<uint32_t>(pushIdx), attr);
     }
+}
+
+// 记录喂入时间轴：首个真实 PCM 的 pts 作为输出帧时间轴锚点，最近值用于前跳对齐。
+void AudioEncoder::MarkFedLocked(int64_t ptsUs) {
+    if (!firstFedSet_) {
+        firstFedPtsUs_ = ptsUs;
+        firstFedSet_ = true;
+    }
+    latestFedPtsUs_ = ptsUs;
 }
 
 void AudioEncoder::Stop() {
@@ -230,6 +267,7 @@ void AudioEncoder::OnNeedInputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
                     self->pcmQueue_.pop_front();
                 }
                 attr.pts = self->pcmPtsNs_ / 1000; // ns → μs
+                self->MarkFedLocked(attr.pts);
                 // 推进队列首时间戳
                 self->pcmPtsNs_ += static_cast<int64_t>(samples) * 1000000000LL / (kSampleRate * kChannels);
                 attr.size = static_cast<int32_t>(samples * 2);
@@ -303,7 +341,29 @@ void AudioEncoder::OnNewOutputData(OH_AVCodec *codec, uint32_t index, OH_AVMemor
     }
 
     if (size > 0 && self->callbacks_.onOutput) {
-        self->callbacks_.onOutput(frame, size, bufferAttr->pts);
+        // 输出帧时间轴自维护（编码器自报 pts 是它自己的帧计数器，见头文件说明）：
+        // 首帧锚定到首包真实 PCM 的喂入时间，之后每帧推进一个 AAC 帧时长；
+        // 喂入侧已明显跑到前面（采集真断过）时只前跳对齐，绝不回退。
+        int64_t outPtsUs = 0;
+        {
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            if (!self->outAnchored_) {
+                self->outPtsUs_ = self->firstFedPtsUs_;
+                self->outAnchored_ = true;
+            } else if (self->latestFedPtsUs_ - self->outPtsUs_ > kOutResyncUs) {
+                self->outPtsUs_ = self->latestFedPtsUs_; // 前跳（采集真断过留下的空洞）
+            }
+            outPtsUs = self->outPtsUs_;
+            self->outPtsUs_ += kAacFrameUs;
+        }
+        // 诊断：确认输出时间轴已与会话时钟对齐（前 3 帧 + 每 1000 帧）
+        static std::atomic<int> outCtr{0};
+        int oc = outCtr.fetch_add(1);
+        if (oc < 3 || oc % 1000 == 0) {
+            MS_LOG_WARN("[AENC-OUT] #%{public}d outPtsUs=%{public}lld (encSelfPts=%{public}lld) size=%{public}d",
+                        oc, static_cast<long long>(outPtsUs), static_cast<long long>(bufferAttr->pts), size);
+        }
+        self->callbacks_.onOutput(frame, size, outPtsUs);
     }
     OH_AudioEncoder_FreeOutputData(codec, index);
 }

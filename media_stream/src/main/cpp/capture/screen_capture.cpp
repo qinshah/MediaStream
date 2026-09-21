@@ -6,6 +6,7 @@
 
 #include <multimedia/player_framework/native_avscreen_capture.h>
 #include <multimedia/player_framework/native_avbuffer.h>
+#include <multimedia/player_framework/native_avbuffer_info.h>
 #include <native_buffer/native_buffer.h>
 #include <window_manager/oh_display_manager.h>
 
@@ -62,6 +63,11 @@ bool ScreenCapture::Start(const Config &config, Callbacks callbacks) {
     probeLastLogNs_.store(0);
     probeWinRecv_.store(0);
     probeWinPass_.store(0);
+    for (int i = 0; i < 2; i++) {
+        audioLastNs_[i].store(0);
+        audioAccNs_[i].store(0);
+        audioCount_[i].store(0);
+    }
 
     capture_ = OH_AVScreenCapture_Create();
     if (capture_ == nullptr) {
@@ -379,13 +385,46 @@ void ScreenCapture::HandleVideoBuffer(OH_AVBuffer *buffer) {
 void ScreenCapture::HandleAudioBuffer(OH_AVBuffer *buffer, bool isMic) {
     uint8_t *addr = OH_AVBuffer_GetAddr(buffer);
     int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
-    if (addr != nullptr && capacity > 0) {
-        const auto &cb = isMic ? callbacks_.onMicAudio : callbacks_.onInnerAudio;
-        if (cb) {
-            cb(addr, capacity, NowNs());
-        }
+    if (addr == nullptr || capacity <= 0) {
+        return;
+    }
+    // 有效长度必须取自 buffer 属性。capacity 只是缓冲池容量：两者相等时看不出区别，
+    // 但一旦 capacity > 本包真实数据（缓冲复用/尾部残留），多出来的字节就是上一包的残差
+    // PCM，被当作真实音频喂进 AAC 编码器 —— 听感即杂音/电音，且采样计数虚增让音轨时长跑偏。
+    int32_t bytes = capacity;
+    OH_AVCodecBufferAttr attr = {};
+    if (OH_AVBuffer_GetBufferAttr(buffer, &attr) == 0 && attr.size > 0 && attr.size <= capacity) {
+        bytes = attr.size;
+    }
+    int64_t nowNs = NowNs();
+    LogAudioCadence(isMic, bytes, nowNs);
+    const auto &cb = isMic ? callbacks_.onMicAudio : callbacks_.onInnerAudio;
+    if (cb) {
+        cb(addr, bytes, nowNs);
     }
     // 同 HandleVideoBuffer：缓冲由框架回收，不得在此释放
+}
+
+// 音频到达节奏诊断：每 64 包打印一次实测平均间隔（μs）与折算采样率。
+// 48000Hz 双声道 s16 下，20ms 包 = 3840 字节；折算采样率应≈48000。
+void ScreenCapture::LogAudioCadence(bool isMic, int32_t bytes, int64_t nowNs) {
+    const int idx = isMic ? 1 : 0;
+    int64_t prev = audioLastNs_[idx].exchange(nowNs);
+    if (prev > 0 && nowNs > prev) {
+        audioAccNs_[idx].fetch_add(nowNs - prev);
+    }
+    int n = audioCount_[idx].fetch_add(1) + 1;
+    if ((n & 0x3F) != 0) {
+        return;
+    }
+    int64_t total = audioAccNs_[idx].exchange(0);
+    int64_t avgUs = total / 63;
+    // 折算采样率 = 本包声道帧数 ÷ 平均间隔（每包 4 字节 = 1 个双声道采样帧）
+    int64_t frames = bytes / 4;
+    int64_t impliedRate = avgUs > 0 ? frames * 1000000 / avgUs : 0;
+    MS_LOG_INFO("[SC-AUD] %{public}s n=%{public}d bytes=%{public}d avgDelta=%{public}lldus rate=%{public}lldHz",
+                isMic ? "mic" : "inner", n, bytes, static_cast<long long>(avgUs),
+                static_cast<long long>(impliedRate));
 }
 
 } // namespace media_stream

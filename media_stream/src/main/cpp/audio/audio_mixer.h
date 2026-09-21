@@ -51,6 +51,13 @@ private:
     int64_t innerPtsNs_ = 0;
     int64_t micPtsNs_ = 0;
     std::vector<int16_t> mixScratch_;
+
+    // 队列溢出丢弃计数（每路）。两路节奏一致时永远为 0；一旦持续增长，说明某一路投递速率
+    // 高于混音消费速率（采样率/包长与 48kHz 假设不符），此时会持续抽掉样本产生咔哒声。
+    // 打日志而不是静默丢弃，是为了让「电音」这类听感问题在日志里有据可查。
+    int64_t droppedInner_ = 0;
+    int64_t droppedMic_ = 0;
+    void DropOldestLocked(std::deque<int16_t> &q, int64_t &dropped, const char *tag);
 };
 
 } // namespace media_stream
